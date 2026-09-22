@@ -1,1 +1,3386 @@
 
+local TEMPLATE=[========[
+local TEMPLATE=__MONO_TEMPLATE_LITERAL__
+local OPEN="["..string.rep("=",8).."["
+local CLOSE="]"..string.rep("=",8).."]"
+local SOURCE=TEMPLATE:gsub("__MONO_TEMPLATE_LITERAL__",function()
+ return OPEN..TEMPLATE..CLOSE
+end,1)
+
+-- Monochrome Hub. Self-contained; loads idle.
+
+local Players=game:GetService("Players")
+
+local player=Players.LocalPlayer
+
+local UIS=game:GetService("UserInputService")
+
+local RunService=game:GetService("RunService")
+
+local TeleportService=game:GetService("TeleportService")
+local HttpService=game:GetService("HttpService")
+
+-- Queue-on-teleport injects this state before re-running the script.
+-- The farm loop itself does not rely on TeleportService teleport settings to resume.
+local runtimeEnv=_G
+if type(getgenv)=="function" then
+ local ok,value=pcall(getgenv)
+ if ok and type(value)=="table" then runtimeEnv=value end
+end
+local BOOT_STATE=type(runtimeEnv.__MONO_V84_STATE)=="table" and runtimeEnv.__MONO_V84_STATE or nil
+runtimeEnv.__MONO_V84_STATE=nil
+
+local AUTO_RESUME_KEY="MonochromeAutoFarmV84Resume"
+local AUTO_JOB_KEY="MonochromeAutoFarmV84PreviousJob"
+local AUTO_DELAY_KEY="MonochromeAutoFarmHopDelay"
+local AUTO_EARNED_KEY="MonochromeAutoFarmV84Earned"
+local AUTO_PAYOUTS_KEY="MonochromeAutoFarmV84Payouts"
+local WEBHOOK_MESSAGE_KEY="MonochromeWebhookV84MessageId"
+local WEBHOOK_ENABLED_KEY="MonochromeWebhookEnabled"
+local VISITED_JOBS_KEY="MonochromeAutoFarmV84VisitedJobs"
+local BALANCE_HISTORY_KEY="MonochromeAutoFarmV84BalanceHistory"
+
+local function setTeleportState(key,value)
+ pcall(function() TeleportService:SetTeleportSetting(key,value) end)
+end
+
+local function getTeleportState(key)
+ local ok,value=pcall(function() return TeleportService:GetTeleportSetting(key) end)
+ return ok and value or nil
+end
+
+local function queueApi()
+ if type(queueonteleport)=="function" then return queueonteleport end
+ if type(queue_on_teleport)=="function" then return queue_on_teleport end
+ if type(syn)=="table" and type(syn.queue_on_teleport)=="function" then return syn.queue_on_teleport end
+ return nil
+end
+
+local function requestApi()
+ local env=nil
+ if type(getgenv)=="function" then
+  local ok,value=pcall(getgenv)
+  if ok and type(value)=="table" then env=value end
+ end
+ env=env or _G
+
+ local function pick(value,name)
+  if type(value)=="function" then return value,name end
+ end
+
+ local fn,name
+ fn,name=pick(env and rawget(env,"request"),"request")
+ if fn then return fn,name end
+ fn,name=pick(env and rawget(env,"http_request"),"http_request")
+ if fn then return fn,name end
+ fn,name=pick(env and rawget(env,"httprequest"),"httprequest")
+ if fn then return fn,name end
+ if type(request)=="function" then return request,"request" end
+ if type(http_request)=="function" then return http_request,"http_request" end
+ if type(http)=="table" and type(http.request)=="function" then return http.request,"http.request" end
+ if type(syn)=="table" and type(syn.request)=="function" then return syn.request,"syn.request" end
+ if type(fluxus)=="table" and type(fluxus.request)=="function" then return fluxus.request,"fluxus.request" end
+ return nil,"none"
+end
+
+local function clearAutoResume()
+ setTeleportState(AUTO_RESUME_KEY,false)
+end
+
+local cleanups,connections={},{}
+local uiHandlers={}
+local UI_PREVIEW=runtimeEnv.__MONO_UI_PREVIEW==true
+
+local dead=false
+
+local teleporting=false
+
+local sessionPayouts=0
+
+local autoLoop=false
+
+local afkStatus="Enabled"
+
+local stopRoute=function() end
+
+local startFarm=function() end
+local armAutoCountdown=function() end
+local manualFarmNow=function() end
+local countdownToken=0
+local countdownActive=false
+local countdownRemaining=0
+local countdownLastTick=0
+local countdownDeadline=0
+
+local function bind(signal,fn)
+ local c=signal:Connect(fn) table.insert(connections,c) return c
+end
+
+local function bindUi(object,eventName,fn)
+ uiHandlers[object]=uiHandlers[object] or {}
+ uiHandlers[object][eventName]=fn
+ return bind(object[eventName],fn)
+end
+
+local function make(kind,props,parent)
+
+ local x=Instance.new(kind) for k,v in pairs(props) do x[k]=v end x.Parent=parent return x
+
+end
+
+local function resolveUiRoot()
+ if type(gethui)=="function" then
+  local ok,root=pcall(gethui)
+  if ok and typeof(root)=="Instance" then return root end
+ end
+ local ok,core=pcall(function() return game:GetService("CoreGui") end)
+ if ok and core then return core end
+ return player:WaitForChild("PlayerGui")
+end
+
+local uiRoot=resolveUiRoot()
+local previous=uiRoot:FindFirstChild("MonochromeHub") or player.PlayerGui:FindFirstChild("MonochromeHub")
+
+if previous then previous:Destroy() end
+
+for _,n in ipairs({"RealCarTuner"}) do
+ local old=uiRoot:FindFirstChild(n) or player.PlayerGui:FindFirstChild(n)
+ if old then old:Destroy() end
+end
+
+local gui=make("ScreenGui",{Name="MonochromeHub",Enabled=false,ResetOnSpawn=false,DisplayOrder=2147483647,ZIndexBehavior=Enum.ZIndexBehavior.Global,IgnoreGuiInset=true},uiRoot)
+pcall(function() gui.OnTopOfCoreBlur=true end)
+pcall(function() gui.ScreenInsets=Enum.ScreenInsets.None end)
+if type(syn)=="table" and type(syn.protect_gui)=="function" then pcall(syn.protect_gui,gui) end
+
+local function destroy()
+
+ if dead then return end dead=true stopRoute("Hub closed",teleporting)
+
+ for _,fn in ipairs(cleanups) do pcall(fn) end
+
+ for _,c in ipairs(connections) do c:Disconnect() end
+
+ if gui.Parent then gui:Destroy() end
+
+end
+
+bind(gui.Destroying,destroy)
+
+-- STATE is injected as a local by Real's live-reload wrapper.
+
+if STATE then STATE.onCleanup(destroy) end
+
+local panel=make("Frame",{Name="Window",Position=UDim2.fromOffset(80,100),Size=UDim2.fromOffset(720,530),BackgroundColor3=Color3.fromRGB(17,17,17),BorderSizePixel=0,Active=true},gui)
+
+make("UICorner",{CornerRadius=UDim.new(0,12)},panel)
+
+make("UIStroke",{Color=Color3.fromRGB(65,65,65)},panel)
+
+local panelScale=make("UIScale",{Scale=1},panel)
+local minimized=false
+
+local function fitAndClampPanel()
+ if dead or not panel.Parent then return end
+ local camera=workspace.CurrentCamera
+ if not camera then return end
+ local viewport=camera.ViewportSize
+ local baseW=720
+ local baseH=minimized and 52 or 530
+ local scale=math.min(1,(viewport.X-12)/baseW,(viewport.Y-12)/baseH)
+ panelScale.Scale=math.clamp(scale,0.10,1)
+
+ local sizeX=baseW*panelScale.Scale
+ local sizeY=baseH*panelScale.Scale
+ local x=panel.Position.X.Offset
+ local y=panel.Position.Y.Offset
+ local maxX=math.max(6,viewport.X-sizeX-6)
+ local maxY=math.max(6,viewport.Y-sizeY-6)
+ panel.Position=UDim2.fromOffset(math.clamp(x,6,maxX),math.clamp(y,6,maxY))
+end
+
+local function label(parent,name,txt,x,y,w,h,size)
+
+ return make("TextLabel",{Name=name,Text=txt,Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(w,h),BackgroundTransparency=1,TextColor3=Color3.fromRGB(225,225,225),TextSize=size or 14,Font=Enum.Font.Gotham,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Center},parent)
+
+end
+
+local activity={}
+
+local logLabel
+
+local function log(txt)
+
+ table.insert(activity,1,os.date("%H:%M:%S").."  "..txt)
+
+ if #activity>35 then table.remove(activity) end
+
+ if logLabel then logLabel.Text=table.concat(activity,"\n\n") end
+
+end
+
+local function button(parent,name,txt,x,y,w,fn)
+
+ local b=make("TextButton",{Name=name,Text=txt,Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(w,34),BackgroundColor3=Color3.fromRGB(43,43,43),TextColor3=Color3.fromRGB(240,240,240),TextSize=13,Font=Enum.Font.GothamBold,BorderSizePixel=0},parent)
+
+ make("UICorner",{CornerRadius=UDim.new(0,6)},b)
+
+ bindUi(b,"Activated",function()
+  local ok,err=pcall(fn)
+  if not ok then log("Error: "..tostring(err)) end
+ end)
+
+ return b
+
+end
+
+local function selectedStyle(b,on)
+
+ b.BackgroundColor3=on and Color3.fromRGB(235,235,235) or Color3.fromRGB(38,38,38)
+
+ b.TextColor3=on and Color3.fromRGB(15,15,15) or Color3.fromRGB(225,225,225)
+
+ b:SetAttribute("Selected",on)
+
+end
+
+-- Native keyboard activity, never teleport/rejoin. Foreground Roblox only.
+
+local afkEnabled=true
+
+local afkRouteBusy=false
+
+local afkBusy=false
+
+local afkGeneration=0
+
+local afkNext=os.clock()+20
+
+local afkLastManual=os.clock()
+
+local afkHeld={}
+
+local afkInterval=30
+
+local function releaseAfkKeys()
+
+ for key in pairs(afkHeld) do pcall(keyrelease,key) end
+
+ table.clear(afkHeld)
+
+end
+
+local function pauseAfkForRoute(busy)
+
+ afkRouteBusy=busy
+
+ afkGeneration+=1
+
+ releaseAfkKeys()
+
+ if busy then afkStatus="Paused / robbing" else afkNext=os.clock()+3 afkStatus="Waiting / native keys" end
+
+end
+
+local function afkReady()
+
+ if dead or not afkEnabled then return false,"Off" end
+
+ if afkRouteBusy then return false,"Paused / robbing" end
+
+ if type(keypress)~="function" or type(keyrelease)~="function" or type(isrbxactive)~="function" then return false,"Native input unavailable" end
+
+ if not isrbxactive() then return false,"Paused / focus Roblox" end
+
+ if UIS:GetFocusedTextBox() or game:GetService("GuiService").MenuIsOpen then return false,"Paused / typing or menu" end
+
+ local c=player.Character local h=c and c:FindFirstChildOfClass("Humanoid") local root=c and c:FindFirstChild("HumanoidRootPart")
+
+ if not h or not root or h.Health<=0 or root.Anchored then return false,"Waiting for character" end
+
+ if h.SeatPart then return false,"Paused / seated" end
+
+ if h.FloorMaterial==Enum.Material.Air then return false,"Waiting for ground" end
+
+ if os.clock()-afkLastManual<12 then return false,"Watching / player active" end
+
+ return true,"Ready"
+
+end
+
+local function pulseAfkKey(key,seconds,token)
+
+ local ready=afkReady()
+
+ if not ready or token~=afkGeneration then return false end
+
+ afkHeld[key]=true
+
+ keypress(key)
+
+ local finish=os.clock()+seconds
+
+ while os.clock()<finish do
+
+  if dead or token~=afkGeneration or afkRouteBusy or not isrbxactive() or UIS:GetFocusedTextBox() then releaseAfkKeys() return false end
+
+  task.wait(0.02)
+
+ end
+
+ keyrelease(key) afkHeld[key]=nil
+
+ return true
+
+end
+
+local function performAfkPulse()
+
+ if afkBusy then return end
+
+ local ready,reason=afkReady()
+
+ if not ready then afkStatus=reason return end
+
+ afkBusy=true
+
+ local token=afkGeneration
+
+ local startJob=game.JobId
+
+ local ok,err=xpcall(function()
+
+  afkStatus="Active / native W + S + jump"
+
+  if not pulseAfkKey(0x57,0.15,token) then return end
+
+  task.wait(0.12)
+
+  if not pulseAfkKey(0x53,0.15,token) then return end
+
+  task.wait(0.12)
+
+  if not pulseAfkKey(0x20,0.08,token) then return end
+
+  gui:SetAttribute("AfkPulses",(gui:GetAttribute("AfkPulses") or 0)+1)
+
+  gui:SetAttribute("AfkSameServer",game.JobId==startJob)
+
+ end,debug.traceback)
+
+ releaseAfkKeys()
+
+ afkBusy=false afkNext=os.clock()+afkInterval
+
+ if not ok then
+
+  afkEnabled=false afkStatus="Off / input error"
+
+  log("Anti-AFK stopped: "..tostring(err))
+
+ elseif afkRouteBusy then afkStatus="Paused / robbing"
+
+ else afkStatus="Waiting / native keys" end
+
+end
+
+bind(UIS.InputBegan,function(input)
+
+
+ if afkBusy and (input.KeyCode==Enum.KeyCode.W or input.KeyCode==Enum.KeyCode.S or input.KeyCode==Enum.KeyCode.Space) then return end
+
+ afkLastManual=os.clock()
+
+ afkGeneration+=1 releaseAfkKeys()
+
+end)
+
+bind(UIS.WindowFocusReleased,function() afkGeneration+=1 releaseAfkKeys() afkStatus="Paused / focus Roblox" end)
+
+bind(player.CharacterAdded,function() afkGeneration+=1 releaseAfkKeys() afkNext=os.clock()+10 end)
+
+bind(player.Idled,function() afkNext=0 end)
+
+table.insert(cleanups,function() afkEnabled=false afkGeneration+=1 releaseAfkKeys() end)
+
+local afkElapsed=0
+
+bind(RunService.Heartbeat,function(dt)
+
+ afkElapsed+=dt if afkElapsed<0.5 then return end afkElapsed=0
+
+ if afkBusy then return end
+
+ local ready,reason=afkReady()
+
+ afkStatus=ready and string.format("Native keys in %ds",math.max(0,math.ceil(afkNext-os.clock()))) or reason
+
+ if ready and os.clock()>=afkNext then task.spawn(performAfkPulse) end
+
+ gui:SetAttribute("AfkEnabled",afkEnabled)
+
+ gui:SetAttribute("AfkRoutePaused",afkRouteBusy)
+
+end)
+
+local header=label(panel,"DragHeader","MONO",20,0,590,52,17)
+
+header.Font=Enum.Font.GothamBold header.Active=true
+
+local shell=make("Frame",{Name="Content",Position=UDim2.fromOffset(0,52),Size=UDim2.new(1,0,1,-52),BackgroundTransparency=1},panel)
+
+local min
+
+min=button(panel,"Minimize","−",628,9,32,function()
+ minimized=not minimized
+ shell.Visible=not minimized
+ panel.Size=UDim2.fromOffset(720,minimized and 52 or 530)
+ min.Text=minimized and "+" or "−"
+ task.defer(fitAndClampPanel)
+end)
+
+button(panel,"Close","×",672,9,32,destroy)
+
+local drag,startPos,panelPos
+
+bind(header.InputBegan,function(i)
+ if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+  drag=i startPos=i.Position panelPos=panel.Position
+ end
+end)
+
+bind(UIS.InputChanged,function(i)
+ if drag and (i==drag or i.UserInputType==Enum.UserInputType.MouseMovement) then
+  local d=i.Position-startPos
+  panel.Position=UDim2.fromOffset(panelPos.X.Offset+d.X,panelPos.Y.Offset+d.Y)
+  fitAndClampPanel()
+ end
+end)
+
+bind(UIS.InputEnded,function(i) if i==drag or i.UserInputType==Enum.UserInputType.MouseButton1 then drag=nil end end)
+
+bind(UIS.WindowFocusReleased,function() drag=nil end)
+
+local pages,tabs={},{}
+
+local function show(name)
+ for n,p in pairs(pages) do
+  p.Visible=n==name
+  local tab=tabs[n]
+  if tab then
+   tab.BackgroundColor3=n==name and Color3.fromRGB(225,225,225) or Color3.fromRGB(35,35,35)
+   tab.TextColor3=n==name and Color3.fromRGB(20,20,20) or Color3.fromRGB(225,225,225)
+  end
+ end
+ gui:SetAttribute("Tab",name)
+end
+
+local nav={
+ {"Overview","HOME"},
+ {"Route","FARM"},
+ {"Car","CAR"},
+ {"Settings","SETTINGS"},
+ {"Activity","LOG"},
+}
+
+for i,item in ipairs(nav) do
+ local name,text=item[1],item[2]
+ pages[name]=make("Frame",{Name=name,Position=UDim2.fromOffset(170,8),Size=UDim2.fromOffset(530,450),BackgroundTransparency=1,Visible=false},shell)
+ tabs[name]=button(shell,name.."Tab",text,16,14+(i-1)*46,135,function() show(name) end)
+end
+
+button(shell,"EmergencyStop","STOP",16,427,135,function() stopRoute("Stopped") end)
+
+local overview=label(pages.Overview,"Summary","Loading…",0,38,515,165,17)
+label(pages.Overview,"Title","SESSION",0,0,510,28,18).Font=Enum.Font.GothamBold
+
+local homeStatus=label(pages.Overview,"HomeStatus","",0,210,510,32,13)
+homeStatus.TextColor3=Color3.fromRGB(165,165,165)
+
+button(pages.Overview,"OpenRoute","FARM",0,286,110,function() show("Route") end)
+
+local homeAutoButton
+homeAutoButton=button(pages.Overview,"HomeAuto","START AUTO",120,286,180,function()
+ if running or autoLoop then
+  stopRoute("AUTO FARM++ stopped")
+ else
+  startFarm(true)
+ end
+end)
+
+local afkButton
+afkButton=button(pages.Overview,"AfkToggle","ANTI-AFK  ON",310,286,150,function()
+ afkEnabled=not afkEnabled afkGeneration+=1 releaseAfkKeys() afkNext=os.clock()+3
+ afkButton.Text=afkEnabled and "ANTI-AFK  ON" or "ANTI-AFK  OFF"
+ selectedStyle(afkButton,afkEnabled)
+end)
+
+button(pages.Overview,"FarmNow","FARM NOW",0,332,180,function() manualFarmNow() end)
+
+local scroll=make("ScrollingFrame",{Name="Log",Size=UDim2.fromOffset(515,438),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new()},pages.Activity)
+logLabel=label(scroll,"Entries","",0,0,495,20,13) logLabel.AutomaticSize=Enum.AutomaticSize.Y logLabel.TextYAlignment=Enum.TextYAlignment.Top
+
+local AUTO_START_DELAY=15
+local AUTO_REJOIN_DELAY=15
+local savedHopDelay=AUTO_REJOIN_DELAY
+local savedWebhook=(BOOT_STATE and BOOT_STATE.webhookEnabled)
+local config={
+ autoBuy=true,
+ maxSpend=20000,
+ retries=2,
+ timeout=3,
+ delay=0.08,
+ camera=true,
+ fastHold=true,
+ hopDelay=AUTO_REJOIN_DELAY,
+ webhook=(type(savedWebhook)=="boolean") and savedWebhook or true,
+ webhookInterval=1
+}
+
+local rows={}
+
+local function available(r)
+
+ local data=r.owner:FindFirstChild("Data")
+
+ return r.prompt:IsDescendantOf(workspace) and r.prompt.Enabled and r.owner:GetAttribute("IsBusy")~=true and (not data or data:GetAttribute("IsBusy")~=true)
+
+end
+
+local function updateAvailability(r)
+
+ local ready=available(r)
+
+ if not ready and r.wasReady~=false then r.fullTransition=r.wasReady==true r.unavailableAt=os.clock() r.sawUnavailable=true end
+
+ if ready and r.wasReady==false then
+
+  if r.unavailableAt and r.fullTransition then r.measuredCooldown=os.clock()-r.unavailableAt end
+
+  r.awaitCycle=false r.unavailableAt=nil
+
+ end
+
+ r.wasReady=ready
+
+ return ready and not r.awaitCycle
+
+end
+
+local running=false
+
+local generation=0
+
+local restoreAttempt=nil
+
+local attempts,confirmed,uncertain,skipped,spent=0,0,0,0,0
+
+local startingBalance=nil
+
+local purchasePending=false
+
+local function moneyValue() local l=player:FindFirstChild("leaderstats") return l and l:FindFirstChild("Saudi Riyal") end
+
+local function balance() local v=moneyValue() return v and tonumber(v.Value) end
+
+local autoEarned=(BOOT_STATE and tonumber(BOOT_STATE.autoEarned)) or tonumber(getTeleportState(AUTO_EARNED_KEY)) or 0
+local autoPayouts=(BOOT_STATE and tonumber(BOOT_STATE.autoPayouts)) or tonumber(getTeleportState(AUTO_PAYOUTS_KEY)) or 0
+local previousJob=(BOOT_STATE and tostring(BOOT_STATE.previousJob or "")) or tostring(getTeleportState(AUTO_JOB_KEY) or "")
+local webhookMessageId=(BOOT_STATE and tostring(BOOT_STATE.webhookMessageId or "")) or ""
+if webhookMessageId=="" then webhookMessageId=tostring(getTeleportState(WEBHOOK_MESSAGE_KEY) or "") end
+if webhookMessageId=="" then webhookMessageId=tostring(getTeleportState("MonochromeWebhookV83MessageId") or "") end
+
+-- Keep a session-wide set of server JobIds so Auto Farm++ never deliberately
+-- revisits a server it has already used during this run.
+local visitedJobs={}
+local visitedJobOrder={}
+local packedVisited=(BOOT_STATE and tostring(BOOT_STATE.visitedJobs or "")) or tostring(getTeleportState(VISITED_JOBS_KEY) or "")
+for id in string.gmatch(packedVisited,"[^,]+") do
+ if id~="" and not visitedJobs[id] then visitedJobs[id]=true table.insert(visitedJobOrder,id) end
+end
+local landedOnVisited=visitedJobs[tostring(game.JobId or "")]==true
+local function saveVisitedJobs()
+ local packed=table.concat(visitedJobOrder,",")
+ setTeleportState(VISITED_JOBS_KEY,packed)
+ return packed
+end
+local function rememberVisitedJob(id)
+ id=tostring(id or "")
+ if id=="" or visitedJobs[id] then return end
+ visitedJobs[id]=true
+ table.insert(visitedJobOrder,id)
+ while #visitedJobOrder>150 do
+  local old=table.remove(visitedJobOrder,1)
+  visitedJobs[old]=nil
+ end
+ saveVisitedJobs()
+end
+rememberVisitedJob(game.JobId)
+
+-- Compact timestamped balance history carried through server hops.
+local balanceHistory={}
+local packedHistory=(BOOT_STATE and tostring(BOOT_STATE.balanceHistory or "")) or tostring(getTeleportState(BALANCE_HISTORY_KEY) or "")
+for item in string.gmatch(packedHistory,"[^;]+") do
+ local stamp,value=item:match("^([^|]+)|(-?%d+)$")
+ if stamp and value then table.insert(balanceHistory,{time=stamp,balance=tonumber(value) or 0}) end
+end
+while #balanceHistory>8 do table.remove(balanceHistory,1) end
+local lastHistoryBalance=#balanceHistory>0 and balanceHistory[#balanceHistory].balance or nil
+
+local webhookStatus="Starting"
+local webhookBusy=false
+local webhookDirty=true
+local webhookLastPush=0
+local webhookRetryAt=0
+local webhookTransport="Not tested"
+local webhookLastError=""
+
+-- User-provided Discord webhook. Anyone with this script can read this URL,
+-- so rotate the webhook in Discord if you ever share the file publicly.
+local WEBHOOK_URL="https://discord.com/api/webhooks/1550447477797429249/JTQDaqo2rRyPXBrIqQg7oveyD6mJRnnEaI_3perEdUPpk8UdRCd_Rai_7rqFTdcbQlT2"
+
+local function commaNumber(value)
+ value=math.floor(tonumber(value) or 0)
+ local sign=value<0 and "-" or ""
+ local n=tostring(math.abs(value))
+ local out=n
+ while true do
+  local changed
+  out,changed=out:gsub("^(%d+)(%d%d%d)","%1,%2")
+  if changed==0 then break end
+ end
+ return sign..out
+end
+
+local function packBalanceHistory()
+ local parts={}
+ for _,entry in ipairs(balanceHistory) do
+  table.insert(parts,tostring(entry.time).."|"..tostring(math.floor(tonumber(entry.balance) or 0)))
+ end
+ return table.concat(parts,";")
+end
+
+local function saveBalanceHistory()
+ setTeleportState(BALANCE_HISTORY_KEY,packBalanceHistory())
+end
+
+local function recordBalanceSnapshot(force)
+ local current=balance()
+ if current==nil then return end
+ current=math.floor(current)
+ if not force and lastHistoryBalance==current then return end
+ local stamp=os.date("%H:%M:%S")
+ local last=balanceHistory[#balanceHistory]
+ if last and last.time==stamp then
+  last.balance=current
+ else
+  table.insert(balanceHistory,{time=stamp,balance=current})
+ end
+ while #balanceHistory>8 do table.remove(balanceHistory,1) end
+ lastHistoryBalance=current
+ saveBalanceHistory()
+ webhookDirty=true
+end
+
+local function balanceHistoryText()
+ if #balanceHistory==0 then return "`Waiting for first balance…`" end
+ local lines={}
+ local first=math.max(1,#balanceHistory-5)
+ for i=first,#balanceHistory do
+  local entry=balanceHistory[i]
+  table.insert(lines,string.format("`%s`  **%s Riyal**",tostring(entry.time),commaNumber(entry.balance)))
+ end
+ return table.concat(lines,"\n")
+end
+
+local function webhookColor()
+ local s=string.lower(tostring(webhookStatus or ""))
+ if s:find("fail",1,true) or s:find("error",1,true) or s:find("stopped",1,true) then return 15548997 end
+ if s:find("hop",1,true) or s:find("finding",1,true) then return 16705372 end
+ if s:find("payout",1,true) or s:find("paid",1,true) then return 5763719 end
+ if s:find("rob",1,true) or s:find("farm",1,true) or s:find("starting",1,true) then return 5793266 end
+ return 2829617
+end
+
+local function webhookIcon()
+ local s=string.lower(tostring(webhookStatus or ""))
+ if s:find("fail",1,true) or s:find("error",1,true) or s:find("stopped",1,true) then return "🔴" end
+ if s:find("hop",1,true) or s:find("finding",1,true) then return "🟡" end
+ if s:find("payout",1,true) or s:find("paid",1,true) then return "🟢" end
+ return "🔵"
+end
+
+local function webhookPayload()
+ local current=balance()
+ local playersNow=#Players:GetPlayers()
+ local maxPlayers="?"
+ pcall(function() maxPlayers=Players.MaxPlayers end)
+ local serverShort=(game.JobId and game.JobId~="") and game.JobId:sub(1,8).."…" or "Unknown"
+ local stateText=tostring(webhookStatus or "")
+ if stateText=="" then stateText="Running" end
+
+ -- Keep the payload intentionally simple. v8.2 performed a second executor HTTP
+ -- request just to resolve a Roblox avatar; on some executors that competes with
+ -- the Discord request transport. Reliability is more important than that image.
+ local embed={
+  title="MONO • AUTO FARM++",
+  description=webhookIcon().."  **"..stateText.."**",
+  color=webhookColor(),
+  author={name=player.DisplayName.."  •  @"..player.Name},
+  fields={
+   {name="💰 BALANCE",value="`"..commaNumber(current).." Riyal`",inline=true},
+   {name="📈 AUTO EARNED",value="`+"..commaNumber(autoEarned).." Riyal`",inline=true},
+   {name="💵 PAYOUTS",value="`"..commaNumber(autoPayouts).."`",inline=true},
+   {name="🌐 SERVER",value="`"..serverShort.."`",inline=true},
+   {name="👥 PLAYERS",value="`"..playersNow.." / "..maxPlayers.."`",inline=true},
+   {name="⏱ FARM DELAY",value="`"..tostring(math.floor(config.hopDelay)).."s`",inline=true},
+   {name="🕒 BALANCE HISTORY",value=balanceHistoryText(),inline=false}
+  },
+  footer={text="MONO Live • updates about every "..tostring(config.webhookInterval).."s"},
+  timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
+ }
+
+ return {
+  username=player.DisplayName.." • MONO",
+  embeds={embed}
+ }
+end
+
+local function responseText(res)
+ if type(res)=="table" then
+  return tostring(res.Body or res.body or res.ResponseBody or "")
+ end
+ return type(res)=="string" and res or tostring(res or "")
+end
+
+local function responseStatus(res)
+ if type(res)~="table" then return 0 end
+ return tonumber(res.StatusCode or res.Status or res.status_code or res.status) or 0
+end
+
+local function webhookRequest(method,url,payload)
+ local req,apiName=requestApi()
+ if not req then
+  webhookTransport="No HTTP API"
+  webhookLastError="No compatible executor HTTP request function was found."
+  return false,webhookLastError,-1
+ end
+
+ local encoded=HttpService:JSONEncode(payload)
+ local headers={
+  ["Content-Type"]="application/json",
+  ["User-Agent"]="Mozilla/5.0"
+ }
+
+ local ok,res=pcall(req,{
+  Url=url,
+  Method=method,
+  Headers=headers,
+  Body=encoded,
+  Timeout=8
+ })
+
+ if not ok then
+  ok,res=pcall(req,{
+   url=url,
+   method=method,
+   headers=headers,
+   body=encoded,
+   timeout=8
+  })
+ end
+
+ if not ok then
+  webhookTransport="Request error via "..tostring(apiName)
+  webhookLastError=tostring(res)
+  return false,webhookLastError,0
+ end
+
+ local status=responseStatus(res)
+ local body=responseText(res)
+ local successFlag=type(res)=="table" and (res.Success==true or res.success==true)
+ local success=successFlag or (status>=200 and status<300)
+
+ -- A few executor request APIs return a body but omit StatusCode. Discord's
+ -- ?wait=true POST response is JSON containing a message id, so accept that.
+ if not success and status==0 and method=="POST" and type(body)=="string" and body:match('"id"%s*:%s*"%d+"') then
+  success=true
+ end
+
+ if success then
+  webhookTransport="Connected via "..tostring(apiName)..(status>0 and (" / "..status) or "")
+  webhookLastError=""
+  return true,body,status
+ end
+
+ webhookTransport="HTTP "..tostring(status).." via "..tostring(apiName)
+ webhookLastError=body~="" and body or "No response body"
+ return false,body,status
+end
+
+local function webhookRetryDelay(body,status)
+ if status==429 and type(body)=="string" and body~="" then
+  local ok,data=pcall(function() return HttpService:JSONDecode(body) end)
+  local value=ok and type(data)=="table" and tonumber(data.retry_after) or nil
+  if value then
+   if value>100 then value=value/1000 end
+   return math.clamp(value+0.35,1,30)
+  end
+ end
+ return status==0 and 3 or 2
+end
+
+local function clearWebhookMessageId()
+ webhookMessageId=""
+ setTeleportState(WEBHOOK_MESSAGE_KEY,"")
+end
+
+local function rememberWebhookMessage(body)
+ if type(body)~="string" or body=="" then return false end
+ local decodedOk,decoded=pcall(function() return HttpService:JSONDecode(body) end)
+ local id=decodedOk and type(decoded)=="table" and decoded.id or body:match('"id"%s*:%s*"(%d+)"')
+ if id then
+  webhookMessageId=tostring(id)
+  setTeleportState(WEBHOOK_MESSAGE_KEY,webhookMessageId)
+  return true
+ end
+ return false
+end
+
+local function pushWebhook(force,recreate,quiet)
+ if not config.webhook or webhookBusy then return false end
+ if not force and not webhookDirty then return false end
+ if not force and os.clock()<webhookRetryAt then return false end
+ webhookBusy=true
+
+ task.spawn(function()
+  local completed,problem=xpcall(function()
+   if recreate then clearWebhookMessageId() end
+
+   local payload=webhookPayload()
+   local ok,body,status=false,"",0
+
+   -- One live card only: edit the known message. Never create another card just
+   -- because an executor reports an odd PATCH status; only a confirmed 404 means
+   -- the Discord message is actually gone and needs replacement.
+   if webhookMessageId~="" then
+    ok,body,status=webhookRequest("PATCH",WEBHOOK_URL.."/messages/"..webhookMessageId,payload)
+    if not ok then
+     if status==429 then
+      webhookRetryAt=os.clock()+webhookRetryDelay(body,status)
+      webhookDirty=true
+      webhookLastPush=os.clock()
+      if not quiet then log("Webhook rate limited / retrying automatically") end
+      return
+     elseif status==404 then
+      clearWebhookMessageId()
+     else
+      webhookRetryAt=os.clock()+webhookRetryDelay(body,status)
+      webhookDirty=true
+      webhookLastPush=os.clock()
+      if not quiet then log("Webhook edit failed / keeping the same message id / "..webhookTransport) end
+      return
+     end
+    end
+   end
+
+   if webhookMessageId=="" then
+    ok,body,status=webhookRequest("POST",WEBHOOK_URL.."?wait=true",payload)
+    if ok then rememberWebhookMessage(body) end
+   end
+
+   webhookLastPush=os.clock()
+   if ok then
+    webhookDirty=false
+    webhookRetryAt=0
+    if force and not quiet then log("Webhook update OK / "..webhookTransport) end
+   else
+    webhookDirty=true
+    webhookRetryAt=os.clock()+webhookRetryDelay(body,status)
+    local short=tostring(webhookLastError or "")
+    if #short>180 then short=short:sub(1,180).."…" end
+    if not quiet then log("Webhook failed / "..webhookTransport..(short~="" and (" / "..short) or "")) end
+   end
+  end,debug.traceback)
+
+  webhookBusy=false
+  if not completed then
+   webhookDirty=true
+   webhookLastPush=os.clock()
+   webhookRetryAt=os.clock()+3
+   webhookTransport="Runtime error"
+   webhookLastError=tostring(problem)
+   if not quiet then log("Webhook error: "..tostring(problem)) end
+  end
+ end)
+ return true
+end
+
+local function syncWebhookForTeleport()
+ if not config.webhook then return end
+ webhookDirty=true
+ if not webhookBusy then pushWebhook(true,false,true) end
+ local deadline=os.clock()+3.5
+ while webhookBusy and os.clock()<deadline and not dead do task.wait(0.05) end
+ if webhookMessageId=="" then
+  local saved=tostring(getTeleportState(WEBHOOK_MESSAGE_KEY) or "")
+  if saved~="" then webhookMessageId=saved end
+ end
+end
+
+local function setWebhookStatus(text)
+ webhookStatus=tostring(text or "")
+ webhookDirty=true
+end
+
+local TOOL="فاتح اقفال متقدم"
+
+local function inventory()
+
+ local tool,uses=nil,0
+
+ local containers={player:FindFirstChildOfClass("Backpack"),player.Character}
+
+ for _,container in pairs(containers) do
+
+  for _,t in ipairs(container:GetChildren()) do if t:IsA("Tool") and t.Name==TOOL then local u=t:FindFirstChild("Remaining_Uses") local n=u and tonumber(u.Value) or 0 if n>0 then tool=tool or t uses+=n end end end
+
+ end
+
+ return tool,uses
+
+end
+
+local function cf(prompt)
+
+ local x=prompt and prompt.Parent
+
+ while x do
+
+  if x:IsA("Attachment") then return x.WorldCFrame elseif x:IsA("BasePart") then return x.CFrame end
+
+  x=x.Parent
+
+ end
+
+end
+
+local routeStatus=label(pages.Route,"Status","IDLE",0,0,510,30,15)
+
+-- AUTO FARM++ / press start -> 15s wait -> farm -> public server hop -> 15s wait -> repeat.
+local hopBusy=false
+
+local function queueSelf()
+ local q=queueApi()
+ if not q then return false,"Teleport queue unavailable in this executor." end
+
+ rememberVisitedJob(game.JobId)
+ local carriedWebhookId=webhookMessageId
+ if carriedWebhookId=="" then carriedWebhookId=tostring(getTeleportState(WEBHOOK_MESSAGE_KEY) or "") end
+ local historyPacked=packBalanceHistory()
+ local visitedPacked=saveVisitedJobs()
+
+ local prefix=string.format(
+  'local e=_G; if type(getgenv)=="function" then local ok,v=pcall(getgenv); if ok and type(v)=="table" then e=v end end; e.__MONO_V84_STATE={hopDelay=%d,autoEarned=%d,autoPayouts=%d,webhookEnabled=%s,webhookMessageId=%q,previousJob=%q,balanceHistory=%q,visitedJobs=%q}\n',
+  math.floor(config.hopDelay),
+  math.floor(autoEarned),
+  math.floor(autoPayouts),
+  tostring(config.webhook==true),
+  tostring(carriedWebhookId or ""),
+  tostring(game.JobId or ""),
+  historyPacked,
+  visitedPacked
+ )
+
+ local ok,err=pcall(q,prefix..SOURCE)
+ if not ok then return false,tostring(err) end
+ return true
+end
+
+local function findServerHopTarget()
+ rememberVisitedJob(game.JobId)
+ local blocked={}
+ for id in pairs(visitedJobs) do blocked[id]=true end
+ if previousJob~="" then blocked[previousJob]=true end
+
+ local cursor=nil
+ local candidates={}
+ for _=1,12 do
+  local url=string.format(
+   "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true",
+   game.PlaceId
+  )
+  if cursor then url..="&cursor="..HttpService:UrlEncode(cursor) end
+
+  local payload=HttpService:JSONDecode(game:HttpGet(url))
+  for _,server in ipairs(payload.data or {}) do
+   if type(server.id)=="string" and not blocked[server.id] and (server.playing or 0)<(server.maxPlayers or math.huge) then
+    table.insert(candidates,server)
+   end
+  end
+
+  if #candidates>=20 then break end
+  cursor=payload.nextPageCursor
+  if not cursor or cursor=="" then break end
+ end
+
+ if #candidates==0 then return nil,"No unvisited non-full public server found." end
+ table.sort(candidates,function(a,b) return (a.playing or 0)<(b.playing or 0) end)
+ local pool=math.min(#candidates,20)
+ return candidates[math.random(1,pool)].id
+end
+
+local function hopForAutoFarm()
+ if hopBusy then return false end
+ if not queueApi() then
+  clearAutoResume()
+  autoLoop=false
+  routeStatus.Text="AUTO FARM++ / teleport queue unavailable"
+  log("AUTO FARM++ needs queueonteleport / queue_on_teleport support.")
+  return false
+ end
+
+ hopBusy=true
+ routeStatus.Text="AUTO FARM++ / finding server"
+ setWebhookStatus("Finding a new server…")
+ log("AUTO FARM++: finding another public server...")
+
+ task.spawn(function()
+  local ok,target,why=pcall(findServerHopTarget)
+  if not ok then
+   hopBusy=false
+   clearAutoResume()
+   autoLoop=false
+   routeStatus.Text="AUTO FARM++ / server lookup failed"
+   log("Server lookup failed: "..tostring(target))
+   return
+  end
+  if not target then
+   hopBusy=false
+   routeStatus.Text="AUTO FARM++ / no unvisited server / retrying"
+   setWebhookStatus("No unvisited server found • retrying")
+   log(why or "No unvisited server found. Retrying without revisiting old servers.")
+   task.delay(8,function()
+    if not dead and autoLoop and not hopBusy then hopForAutoFarm() end
+   end)
+   return
+  end
+
+  if dead or not autoLoop then
+   hopBusy=false
+   return
+  end
+
+  routeStatus.Text="AUTO FARM++ / server hopping"
+  setWebhookStatus("Server hopping…")
+  syncWebhookForTeleport()
+
+  local queued,qerr=queueSelf()
+  if not queued then
+   hopBusy=false
+   clearAutoResume()
+   autoLoop=false
+   routeStatus.Text="AUTO FARM++ / queue failed"
+   log("Teleport queue failed: "..tostring(qerr))
+   return
+  end
+
+  setTeleportState(AUTO_RESUME_KEY,true)
+  setTeleportState(AUTO_JOB_KEY,game.JobId)
+  autoLoop=true
+  teleporting=true
+  routeStatus.Text="AUTO FARM++ / server hopping"
+  setTeleportState(AUTO_DELAY_KEY,config.hopDelay)
+  setTeleportState(WEBHOOK_ENABLED_KEY,config.webhook)
+  setWebhookStatus("Server hopping…")
+  log("AUTO FARM++: hopping to unvisited server "..target:sub(1,8).."...")
+  saveVisitedJobs()
+  stopRoute("AUTO FARM++ / server hopping",true)
+  releaseAfkKeys()
+  task.wait(0.35)
+
+  if dead or not autoLoop then
+   teleporting=false
+   hopBusy=false
+   return
+  end
+
+  local teleported,err=pcall(function()
+   TeleportService:TeleportToPlaceInstance(game.PlaceId,target,player)
+  end)
+  if not teleported then
+   teleporting=false
+   hopBusy=false
+   clearAutoResume()
+   autoLoop=false
+   routeStatus.Text="AUTO FARM++ / teleport failed"
+   setWebhookStatus("Teleport failed")
+   log("Teleport failed: "..tostring(err))
+  end
+ end)
+
+ return true
+end
+
+bind(TeleportService.TeleportInitFailed,function(who,result,message)
+ if who==player and hopBusy then
+  teleporting=false
+  hopBusy=false
+  clearAutoResume()
+  autoLoop=false
+  routeStatus.Text="AUTO FARM++ / teleport failed"
+  setWebhookStatus("Teleport failed")
+  log("Teleport failed: "..tostring(result).." / "..tostring(message))
+ end
+end)
+
+label(pages.Route,"FarmTitle","FARM  •  PRESS START AUTO",0,0,510,28,18).Font=Enum.Font.GothamBold
+routeStatus.Position=UDim2.fromOffset(0,30)
+routeStatus.Size=UDim2.fromOffset(510,28)
+routeStatus.TextSize=13
+
+local list=make("ScrollingFrame",{Name="Cashiers",Position=UDim2.fromOffset(0,106),Size=UDim2.fromOffset(515,282),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.new()},pages.Route)
+
+local function renderRows()
+ for _,x in ipairs(list:GetChildren()) do x:Destroy() end
+
+ for i,r in ipairs(rows) do
+  local b=make("TextButton",{Name="Register"..i,Text="",Position=UDim2.fromOffset(0,(i-1)*43),Size=UDim2.fromOffset(499,37),BackgroundColor3=Color3.fromRGB(29,29,29),TextColor3=Color3.fromRGB(230,230,230),TextSize=13,Font=Enum.Font.Gotham,BorderSizePixel=0,TextXAlignment=Enum.TextXAlignment.Left},list)
+  make("UICorner",{CornerRadius=UDim.new(0,6)},b)
+  r.button=b
+  selectedStyle(b,r.selected)
+  b.Activated:Connect(function()
+   if not running then
+    r.selected=not r.selected
+    selectedStyle(b,r.selected)
+   end
+  end)
+ end
+
+ list.CanvasSize=UDim2.fromOffset(0,#rows*43)
+end
+
+local function scan()
+
+ if running then log("Stop the route before rescanning.") return end
+
+ local keep={} for _,r in ipairs(rows) do keep[r.prompt]=r end
+
+ rows={}
+
+ local folder=workspace:FindFirstChild("Cashiers")
+
+ local streets=workspace:FindFirstChild("STREETs")
+
+ local model=streets and streets:FindFirstChild("Model")
+
+ local seen={}
+
+ local function include(owner)
+
+  local att=owner and owner:FindFirstChild("ATT")
+
+  local p=att and att:FindFirstChild("StartProximity")
+
+  if not p or not p:IsA("ProximityPrompt") or seen[p] or not cf(p) then return end
+
+  seen[p]=true
+
+  local data=owner:FindFirstChild("Data") local loc=data and data:FindFirstChild("Location")
+
+  if not loc then return end
+
+  local old=keep[p]
+
+  local r=old or {prompt=p,owner=owner,name=tostring(loc.Value),selected=true,status="Ready",position=cf(p).Position}
+
+  table.insert(rows,r)
+
+ end
+
+ if folder then for _,owner in ipairs(folder:GetChildren()) do include(owner) end end
+
+ include(model and model:FindFirstChild("Cashiers2"))
+
+ table.sort(rows,function(a,b) if a.name~=b.name then return a.name<b.name end return a.position.X<b.position.X end)
+
+ renderRows() log("Loaded "..#rows.." unique registers, including the extra cashiers.") gui:SetAttribute("Registers",#rows)
+
+end
+
+local function valid(token) return not dead and running and generation==token end
+
+local function waitFor(seconds,token)
+
+ local untilTime=os.clock()+seconds
+
+ while os.clock()<untilTime do if not valid(token) then return false end task.wait(0.03) end
+
+ return valid(token)
+
+end
+
+stopRoute=function(message,preserveResume)
+
+ generation+=1 running=false
+ if preserveResume then
+  autoLoop=true
+ else
+  autoLoop=false
+  countdownToken+=1
+  countdownActive=false
+  countdownRemaining=0
+  countdownLastTick=0
+  countdownDeadline=0
+  clearAutoResume()
+  setWebhookStatus(message or "Stopped")
+ end
+
+ pauseAfkForRoute(false)
+
+ if restoreAttempt then local f=restoreAttempt restoreAttempt=nil pcall(f) end
+
+ if not dead then routeStatus.Text=message or "Stopped" gui:SetAttribute("Running",false) end
+
+end
+
+bind(player.CharacterAdded,function()
+ if running then
+  if autoLoop then
+   stopRoute("AUTO FARM++ / respawn / restarting",true)
+   task.delay(3,function()
+    if not dead and autoLoop then armAutoCountdown(false) end
+   end)
+  else
+   stopRoute("Stopped after respawn")
+  end
+ end
+end)
+
+local LOCKPICK_USES=3
+local LOCKPICK_PRICE=2000
+local READY_RECHECK=0.08
+
+local function purchase(token,readyCount,currentUses)
+
+ readyCount=math.max(0,math.floor(tonumber(readyCount) or 0))
+ currentUses=math.max(0,math.floor(tonumber(currentUses) or 0))
+
+ -- Buy only for cashiers that are actually ready now. Existing Remaining_Uses
+ -- count toward the requirement, and one new lockpick contributes 3 uses.
+ local missingUses=math.max(0,readyCount-currentUses)
+ local quantity=math.ceil(missingUses/LOCKPICK_USES)
+ local cost=quantity*LOCKPICK_PRICE
+
+ if quantity<=0 then return true,0 end
+
+ if cost>config.maxSpend or not balance() or balance()<cost then return false,"Purchase exceeds budget or balance." end
+
+ local rs=game:GetService("ReplicatedStorage")
+
+ local a=rs:FindFirstChild("Replicated") local b=a and a:FindFirstChild("Events") local c=b and b:FindFirstChild("MarketEvent") local remote=c and c:FindFirstChild("Event")
+
+ if not remote or not remote:IsA("RemoteFunction") then return false,"Market unavailable." end
+
+ routeStatus.Text="BUYING  /  "..quantity.." lockpick(s) for "..readyCount.." ready cashier(s)"
+ setWebhookStatus("Buying "..quantity.." lockpick(s) for "..readyCount.." ready cashier(s)…")
+
+ local done,ok,result=false,false,nil
+
+ purchasePending=true
+
+ task.spawn(function()
+
+  if valid(token) then ok,result=pcall(function() return remote:InvokeServer("Buy",{[TOOL]=quantity},cost) end) end
+
+  done=true purchasePending=false
+
+ end)
+
+ local deadline=os.clock()+10
+
+ while not done and os.clock()<deadline and valid(token) do task.wait(0.05) end
+
+ if not valid(token) then return false,"Stopped; an already-sent purchase may still complete." end
+
+ if not done then return false,"Purchase outcome unknown; check inventory before restarting." end
+
+ if not ok or result~="تم الشراء" then return false,"Purchase not confirmed: "..tostring(result) end
+
+ spent+=cost
+
+ if not waitFor(0.15,token) then return false,"Stopped after purchase." end
+ return true,quantity
+
+end
+
+local function attempt(r,token)
+
+ if not r.prompt.Parent then return "missing" end
+
+ if not available(r) or r.awaitCycle then return "busy" end
+
+ local character=player.Character local h=character and character:FindFirstChildOfClass("Humanoid") local root=character and character:FindFirstChild("HumanoidRootPart")
+
+ if not h or not root or h.Health<=0 then return "character" end
+
+ if h.SeatPart then return "seated" end
+
+ local tool,usesBefore=inventory() if not tool then return "tool" end
+
+ local prompt=r.prompt local target=cf(prompt) if not target then return "missing" end
+
+ local original={hold=prompt.HoldDuration,distance=prompt.MaxActivationDistance,los=prompt.RequiresLineOfSight,anchored=root.Anchored,ragdoll=h:GetStateEnabled(Enum.HumanoidStateType.Ragdoll),falling=h:GetStateEnabled(Enum.HumanoidStateType.FallingDown),platform=h.PlatformStand}
+
+ local camera=workspace.CurrentCamera
+
+ local cameraOriginal=camera and {kind=camera.CameraType,subject=camera.CameraSubject,cf=camera.CFrame,focus=camera.Focus}
+
+ local collision={}
+
+ local cleaned=false
+
+ local stabilityConnection
+
+ local cameraBound=false
+
+ local cameraBinding="MonochromeRouteCamera"
+
+ local function cleanup()
+
+  if cleaned then return end cleaned=true
+
+  if stabilityConnection then stabilityConnection:Disconnect() end
+
+  if cameraBound then RunService:UnbindFromRenderStep(cameraBinding) cameraBound=false end
+
+  pcall(function() prompt:InputHoldEnd() prompt.HoldDuration=original.hold prompt.MaxActivationDistance=original.distance prompt.RequiresLineOfSight=original.los end)
+
+  for part,value in pairs(collision) do if part.Parent then part.CanCollide=value end end
+
+  if root.Parent then root.Anchored=original.anchored end
+
+  if h.Parent then h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,original.ragdoll) h:SetStateEnabled(Enum.HumanoidStateType.FallingDown,original.falling) h.PlatformStand=original.platform end
+
+  if config.camera and camera and cameraOriginal then pcall(function() camera.CameraType=cameraOriginal.kind camera.CameraSubject=cameraOriginal.subject camera.CFrame=cameraOriginal.cf camera.Focus=cameraOriginal.focus end) end
+
+ end
+
+ restoreAttempt=cleanup
+
+ local result="error"
+
+ local ok,err=xpcall(function()
+
+  local function stabilize()
+
+   if cleaned or not root.Parent or not h.Parent then return end
+
+   h.PlatformStand=false h.Sit=false
+
+   root.AssemblyAngularVelocity=Vector3.zero
+
+   if root.AssemblyLinearVelocity.Magnitude>40 then root.AssemblyLinearVelocity=Vector3.zero end
+
+   local state=h:GetState()
+
+   if state==Enum.HumanoidStateType.Ragdoll or state==Enum.HumanoidStateType.FallingDown then h:ChangeState(Enum.HumanoidStateType.GettingUp) end
+
+   for _,part in ipairs(character:GetDescendants()) do if part:IsA("BasePart") then
+
+    if collision[part]==nil then collision[part]=part.CanCollide end
+
+    part.CanCollide=false
+
+   end end
+
+  end
+
+  h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,false)
+
+  h:SetStateEnabled(Enum.HumanoidStateType.FallingDown,false)
+
+  stabilize()
+
+  stabilityConnection=RunService.Heartbeat:Connect(stabilize)
+
+  root.Anchored=true root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
+
+  -- Same approach as the supplied moveToPrompt: local offset, level facing,
+
+  -- two physics frames, then GettingUp. Guard vertically oriented attachments.
+
+  local raw=target*CFrame.new(0,0,2.25)
+
+  local stand=raw.Position
+
+  local lookAt=Vector3.new(target.X,stand.Y,target.Z)
+
+  if (lookAt-stand).Magnitude<=0.05 then
+
+   local direction=Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+
+   if direction.Magnitude<0.05 then direction=Vector3.new(0,0,-1) end
+
+   stand=target.Position-direction.Unit*2.25
+
+   lookAt=Vector3.new(target.X,stand.Y,target.Z)
+
+  end
+
+  character:PivotTo(CFrame.lookAt(stand,lookAt))
+
+  RunService.Heartbeat:Wait()
+
+  if not valid(token) then result="cancel" return end
+
+  RunService.Heartbeat:Wait()
+
+  if not valid(token) then result="cancel" return end
+
+  root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
+
+  root.Anchored=original.anchored
+
+  h.PlatformStand=false h.Sit=false h:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+  local facing=Vector3.new(target.X,root.Position.Y,target.Z)
+
+  if (facing-root.Position).Magnitude>0.05 then root.CFrame=CFrame.lookAt(root.Position,facing) end
+
+  if config.camera and camera then
+
+   local params=RaycastParams.new()
+
+   params.FilterType=Enum.RaycastFilterType.Exclude
+
+   local part=prompt.Parent
+
+   while part and not part:IsA("BasePart") do part=part.Parent end
+
+   local filters={character} if part then table.insert(filters,part) end
+
+   params.FilterDescendantsInstances=filters
+
+   RunService:BindToRenderStep(cameraBinding,Enum.RenderPriority.Camera.Value+1,function()
+
+    if cleaned or not root.Parent or not prompt.Parent then return end
+
+    local now=cf(prompt) if not now then return end
+
+    local position=now.Position
+
+    local desired=root.Position+Vector3.new(0,1.7,0)
+
+    local ray=desired-position
+
+    if ray.Magnitude<0.3 then ray=Vector3.new(0,1,2) desired=position+ray end
+
+    local hit=workspace:Raycast(position,ray,params)
+
+    if hit then desired=position+ray.Unit*math.max(0.35,hit.Distance-0.20) end
+
+    local direction=position-desired
+
+    local up=Vector3.yAxis
+
+    if math.abs(direction.Unit:Dot(up))>0.995 then up=Vector3.zAxis end
+
+    camera.CameraType=Enum.CameraType.Scriptable
+
+    camera.CFrame=CFrame.lookAt(desired,position,up)
+
+    camera.Focus=CFrame.new(position)
+
+   end)
+
+   cameraBound=true
+
+   RunService.RenderStepped:Wait()
+
+   if not valid(token) then result="cancel" return end
+
+   RunService.RenderStepped:Wait()
+
+  end
+
+  if not waitFor(config.delay,token) then result="cancel" return end
+
+  if not available(r) then result="busy" return end
+
+  h:EquipTool(tool)
+
+  -- Usually synchronous, but this tiny conditional wait fixes cases where the
+  -- prompt fires before the lockpick actually reaches the character.
+  local equipDeadline=os.clock()+0.25
+  while tool.Parent~=character and os.clock()<equipDeadline do
+   if not valid(token) then result="cancel" return end
+   RunService.Heartbeat:Wait()
+  end
+  if tool.Parent~=character then result="tool" return end
+
+  if config.fastHold then prompt.HoldDuration=0.0001 end
+
+  prompt.RequiresLineOfSight=false
+  prompt.MaxActivationDistance=math.max(original.distance,10)
+
+  local before=balance()
+
+  prompt:InputHoldBegin()
+
+  if not waitFor(math.max(0.05,prompt.HoldDuration+0.03),token) then result="cancel" return end
+
+  prompt:InputHoldEnd()
+
+  -- Two-stage confirmation. We only spend ~1.6s waiting for the server to
+  -- acknowledge the robbery. If a lockpick use is consumed, we do NOT retry;
+  -- we give the balance a short grace period and then continue as accepted.
+  local started=os.clock()
+  local acceptDeadline=started+math.min(config.timeout,1.60)
+  local hardDeadline=started+math.max(1.60,config.timeout)
+  local consumedAt=nil
+  local busyAt=nil
+
+  local function markCycle(nowReady)
+   r.awaitCycle=true
+   r.observedAt=os.clock()
+   r.sawUnavailable=not nowReady
+   if not nowReady then
+    r.wasReady=false
+    r.fullTransition=true
+    r.unavailableAt=r.unavailableAt or os.clock()
+   end
+  end
+
+  while true do
+   if not valid(token) then result="cancel" return end
+
+   local _,remaining=inventory()
+   local current=balance()
+   local nowReady=available(r)
+   local now=os.clock()
+
+   if remaining<usesBefore and not consumedAt then consumedAt=now end
+   if not nowReady and not busyAt then busyAt=now end
+
+   local payoutDelta=(before and current) and (current-before) or 0
+   if payoutDelta>=3000 and (consumedAt or busyAt) then
+    sessionPayouts+=1
+    if autoLoop then
+     autoEarned+=payoutDelta
+     autoPayouts+=1
+     setTeleportState(AUTO_EARNED_KEY,autoEarned)
+     setTeleportState(AUTO_PAYOUTS_KEY,autoPayouts)
+     recordBalanceSnapshot(false)
+     setWebhookStatus("Payout confirmed • +"..commaNumber(payoutDelta).." Riyal")
+    end
+    markCycle(nowReady)
+    result="observed"
+    log(r.name..": payout confirmed +"..payoutDelta..".")
+    return
+   end
+
+   -- Use consumption is a strong acceptance signal. Waiting the old full timeout
+   -- here could cause duplicate retries and burn extra lockpick uses.
+   if consumedAt and (now-consumedAt>=0.60 or now>=hardDeadline) then
+    markCycle(nowReady)
+    result="accepted"
+    log(r.name..": lockpick use consumed; payout replication still pending.")
+    return
+   end
+
+   -- Busy with no consumed use is treated as a cashier race, not a failed rob.
+   if not consumedAt and busyAt and now-busyAt>=0.30 then
+    result="busy"
+    return
+   end
+
+   if not consumedAt and now>=acceptDeadline then
+    result="no-response"
+    return
+   end
+
+   if now>=hardDeadline then
+    result=consumedAt and "accepted" or "no-response"
+    return
+   end
+
+   task.wait(0.03)
+  end
+ end,debug.traceback)
+
+ cleanup() if restoreAttempt==cleanup then restoreAttempt=nil end
+
+ if not ok then log("Attempt error: "..tostring(err)) result="error" end
+
+ return result
+
+end
+
+local function start(loopMode)
+ if running then return end
+ if purchasePending then routeStatus.Text="Purchase still pending" return end
+ if not loopMode and player.PlayerGui:FindFirstChild("RouteMenu") then routeStatus.Text="Close RouteMenu first" return end
+
+ local char=player.Character
+ local h=char and char:FindFirstChildOfClass("Humanoid")
+ if not h or h.Health<=0 or h.SeatPart then routeStatus.Text="Stand outside the car first" return end
+
+ if loopMode and not queueApi() then
+  routeStatus.Text="AUTO FARM++ / teleport queue unavailable"
+  log("AUTO FARM++ needs queueonteleport / queue_on_teleport support.")
+  return
+ end
+
+ local targets={}
+ for _,r in ipairs(rows) do
+  if loopMode or r.selected then table.insert(targets,r) end
+ end
+ if #targets==0 then routeStatus.Text="No cashiers selected" return end
+
+ pauseAfkForRoute(true)
+ running=true autoLoop=loopMode==true generation+=1
+ local token=generation
+
+ gui:SetAttribute("Running",true)
+ startingBalance=startingBalance or balance()
+ attempts=0 confirmed=0 uncertain=0 skipped=0 spent=0
+
+ task.spawn(function()
+  local ok,err=xpcall(function()
+   local queue={}
+   for _,r in ipairs(targets) do
+    if updateAvailability(r) then
+     table.insert(queue,r)
+     r.status="Queued"
+    end
+   end
+
+   if #queue==0 then
+    if loopMode then
+     routeStatus.Text="AUTO FARM++ / no ready cashiers / hopping"
+     hopForAutoFarm()
+    else
+     stopRoute("No selected cashier is ready")
+    end
+    return
+   end
+
+   -- Recheck readiness immediately before spending. A cashier may have become
+   -- busy after the scan, and we should never buy a lockpick for that cashier.
+   if not waitFor(READY_RECHECK,token) then return end
+   local readyNow={}
+   for _,r in ipairs(queue) do
+    if updateAvailability(r) then
+     table.insert(readyNow,r)
+    else
+     r.status="Busy"
+    end
+   end
+   queue=readyNow
+
+   if #queue==0 then
+    if loopMode then
+     routeStatus.Text="AUTO FARM++ / cashiers became busy / hopping"
+     setWebhookStatus("Cashiers became busy • hopping")
+     hopForAutoFarm()
+    else
+     stopRoute("No selected cashier is ready")
+    end
+    return
+   end
+
+   local _,uses=inventory()
+   if uses<#queue then
+    if config.autoBuy or loopMode then
+     local bought,why=purchase(token,#queue,uses)
+     if not bought then
+      if valid(token) then log(why or "Purchase stopped") stopRoute(why) end
+      return
+     end
+
+     local deadline=os.clock()+2.5
+     repeat
+      local _,n=inventory()
+      uses=n
+      if uses>=#queue then break end
+      if not waitFor(0.06,token) then return end
+     until os.clock()>=deadline
+    end
+
+    if uses<#queue then
+     stopRoute("Not enough lockpick uses")
+     return
+    end
+   end
+
+   log("Farm cycle: "..#queue.." ready cashier(s), "..uses.." lockpick use(s) available.")
+
+   while #queue>0 and valid(token) do
+    local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not root then stopRoute("Character unavailable") return end
+
+    table.sort(queue,function(a,b)
+     return (a.position-root.Position).Magnitude<(b.position-root.Position).Magnitude
+    end)
+
+    local r=table.remove(queue,1)
+    local result
+
+    for n=1,config.retries do
+     if not valid(token) then return end
+     attempts+=1
+     r.status="Attempt "..n
+     routeStatus.Text="FARMING / "..r.name
+     setWebhookStatus("Robbing • "..r.name)
+
+     result=attempt(r,token)
+     if result~="no-response" then break end
+     if not waitFor(0.15*n,token) then return end
+    end
+
+    if not valid(token) then return end
+
+    if result=="observed" then
+     confirmed+=1
+     r.status="Paid"
+    elseif result=="accepted" then
+     uncertain+=1
+     r.status="Accepted"
+    elseif result=="uncertain" then
+     uncertain+=1
+     r.status="Uncertain"
+    elseif result=="tool" then
+     stopRoute("No lockpick uses left")
+     return
+    elseif result=="seated" or result=="character" then
+     stopRoute("Character not ready")
+     return
+    else
+     skipped+=1
+     r.status="Skipped"
+    end
+
+    log(r.name.." / "..r.status)
+
+    -- Overnight fail-safe: a cashier that gives no usable response after all
+    -- retries is treated as a bad/glitched server. Do not stop Auto Farm++;
+    -- preserve the loop and immediately move to another unvisited server.
+    if loopMode and result~="observed" and result~="accepted" and result~="uncertain" and result~="busy" and result~="missing" then
+     routeStatus.Text="AUTO FARM++ / cashier glitched / hopping"
+     setWebhookStatus("Cashier no response after retries • hopping")
+     log("AUTO FARM++: "..r.name.." gave no usable response after "..tostring(config.retries).." retries; abandoning this server.")
+     hopForAutoFarm()
+     return
+    end
+
+    if not waitFor(0.05,token) then return end
+   end
+
+   if not loopMode then
+    stopRoute("DONE / "..confirmed.." paid, "..uncertain.." uncertain")
+    return
+   end
+
+   if confirmed+uncertain<=0 then
+    routeStatus.Text="AUTO FARM++ / nothing paid / hopping"
+    setWebhookStatus("No payout this server • hopping")
+    log("AUTO FARM++: no accepted robbery signal; moving to another unvisited server.")
+    hopForAutoFarm()
+    return
+   end
+
+   routeStatus.Text="AUTO FARM++ / cycle done / hopping"
+   setWebhookStatus("Cycle complete • hopping…")
+   if not waitFor(0.15,token) then return end
+   hopForAutoFarm()
+  end,debug.traceback)
+
+  if not ok and valid(token) then
+   log(tostring(err))
+   stopRoute("Error / farm stopped")
+  end
+ end)
+end
+
+startFarm=function(loopMode)
+ if not loopMode then start(false) return end
+ if running or hopBusy or countdownActive then return end
+ if not queueApi() then
+  routeStatus.Text="AUTO FARM++ / teleport queue unavailable"
+  log("AUTO FARM++ needs queueonteleport / queue_on_teleport support.")
+  return
+ end
+
+ autoLoop=true
+ autoEarned=0
+ autoPayouts=0
+ sessionPayouts=0
+ setTeleportState(AUTO_EARNED_KEY,0)
+ setTeleportState(AUTO_PAYOUTS_KEY,0)
+ webhookMessageId=""
+ previousJob=""
+ setTeleportState(WEBHOOK_MESSAGE_KEY,"")
+ setTeleportState(AUTO_JOB_KEY,"")
+ setTeleportState(AUTO_DELAY_KEY,config.hopDelay)
+ setTeleportState(WEBHOOK_ENABLED_KEY,config.webhook)
+ setTeleportState(AUTO_RESUME_KEY,true)
+ setWebhookStatus("Auto Farm++ started • preparing first farm")
+ armAutoCountdown(false)
+end
+
+local loopButton
+loopButton=button(pages.Route,"AutoPlus","START AUTO",0,64,150,function()
+ if running or autoLoop then
+  stopRoute("AUTO FARM++ stopped")
+ else
+  startFarm(true)
+ end
+end)
+
+button(pages.Route,"FarmNow","FARM NOW",160,64,150,function() manualFarmNow() end)
+button(pages.Route,"Rescan","SCAN",320,64,110,scan)
+
+local buyButton
+buyButton=button(pages.Settings,"AutoBuy","AUTO BUY  ON",0,15,210,function()
+ if running then return end
+ config.autoBuy=not config.autoBuy
+ buyButton.Text=config.autoBuy and "AUTO BUY  ON" or "AUTO BUY  OFF"
+ selectedStyle(buyButton,config.autoBuy)
+end)
+
+local function setting(name,title,y,key,low,high)
+ label(pages.Settings,name.."Label",title,0,y,250,30,13)
+ local box=make("TextBox",{Name=name,Text=tostring(config[key]),Position=UDim2.fromOffset(300,y),Size=UDim2.fromOffset(140,30),BackgroundColor3=Color3.fromRGB(40,40,40),TextColor3=Color3.fromRGB(240,240,240),TextSize=14,Font=Enum.Font.Gotham,ClearTextOnFocus=false,BorderSizePixel=0},pages.Settings)
+ make("UICorner",{CornerRadius=UDim.new(0,6)},box)
+ bindUi(box,"FocusLost",function()
+  if not running then
+   local n=tonumber(box.Text)
+   if n and n==n then
+    config[key]=math.clamp(n,low,high)
+    if key=="retries" or key=="hopDelay" then config[key]=math.floor(config[key]) end
+    if key=="hopDelay" then
+     config.hopDelay=AUTO_REJOIN_DELAY
+     setTeleportState(AUTO_DELAY_KEY,AUTO_REJOIN_DELAY)
+     if countdownActive and autoLoop then armAutoCountdown(BOOT_STATE~=nil) end
+    end
+   end
+  end
+  box.Text=tostring(config[key])
+ end)
+ return box
+end
+
+label(pages.Settings,"Title","SETTINGS",0,0,510,28,18).Font=Enum.Font.GothamBold
+buyButton.Position=UDim2.fromOffset(0,48)
+
+setting("Budget","Budget / cycle",100,"maxSpend",0,20000)
+setting("Retries","Retries",144,"retries",1,3)
+setting("Timeout","Response timeout",188,"timeout",1,10)
+setting("Settle","Arrival delay",232,"delay",0.03,1)
+setting("HopDelay","Post-hop wait (fixed at 15 seconds)",276,"hopDelay",15,15)
+
+local webhookButton
+webhookButton=button(pages.Settings,"Webhook","WEBHOOK  ON",0,332,180,function()
+ config.webhook=not config.webhook
+ setTeleportState(WEBHOOK_ENABLED_KEY,config.webhook)
+ webhookButton.Text=config.webhook and "WEBHOOK  ON" or "WEBHOOK  OFF"
+ selectedStyle(webhookButton,config.webhook)
+ setWebhookStatus(config.webhook and "Webhook enabled" or "Webhook disabled")
+end)
+selectedStyle(webhookButton,config.webhook)
+webhookButton.Text=config.webhook and "WEBHOOK  ON" or "WEBHOOK  OFF"
+
+button(pages.Settings,"WebhookTest","TEST WEBHOOK",190,332,150,function()
+ if not config.webhook then
+  config.webhook=true
+  setTeleportState(WEBHOOK_ENABLED_KEY,true)
+  webhookButton.Text="WEBHOOK  ON"
+  selectedStyle(webhookButton,true)
+ end
+ webhookStatus="Manual webhook test"
+ webhookDirty=true
+ log("Webhook test requested. Check LOG for HTTP result.")
+ pushWebhook(true,false,false)
+end)
+
+local webhookInfo=label(pages.Settings,"WebhookInfo","Webhook: "..webhookTransport,0,370,510,24,12)
+webhookInfo.TextColor3=Color3.fromRGB(165,165,165)
+
+bind(RunService.Heartbeat,function()
+ if webhookInfo and webhookInfo.Parent then
+  local extra=webhookLastError~="" and (" / "..webhookLastError:sub(1,52)) or ""
+  webhookInfo.Text="Webhook: "..webhookTransport..extra
+ end
+end)
+
+local settingsHint=label(pages.Settings,"Hint","START AUTO waits 15s, farms, then server-hops and repeats. FARM NOW farms this server only and never hops.",0,400,510,32,12)
+settingsHint.TextColor3=Color3.fromRGB(165,165,165)
+
+scan() show("Overview") log("Hub ready. Auto Farm++ is idle until START AUTO is pressed.")
+
+
+local function mountCar(carPage) local P=player local RS=RunService
+
+local closed=false
+
+local connections={}
+
+local active=nil
+
+local profile="Stock"
+
+local acceleration=0
+
+local speedCap=180
+
+local minimized=false
+
+local notice="Ready"
+
+local function bind(sig,fn) local c=sig:Connect(fn) table.insert(connections,c) return c end
+
+local function copy(t) local r={} for k,v in pairs(t) do r[k]=v end return r end
+
+local fields={"SpeedLimit","SteerSpeed","ReturnSpeed","ThrotAccel","Drivetrain","TransModes"}
+
+local function restore()
+
+ if not active then return end
+
+ for k,v in pairs(active.original) do active.tune[k]=v end
+
+ for s,o in pairs(active.springs) do if s.Parent then
+
+  s.MinLength=0 s.MaxLength=o.MaxLength s.MinLength=o.MinLength s.FreeLength=o.FreeLength s.Stiffness=o.Stiffness s.Damping=o.Damping
+
+ end end
+
+ for att,original in pairs(active.anchors) do if att.Parent then att.CFrame=original end end
+
+ for t,values in pairs(active.driveLists) do table.clear(t) for i,v in ipairs(values) do t[i]=v end end
+
+ for wheel,v in pairs(active.physics) do if wheel.Parent then wheel.CustomPhysicalProperties=v.custom or nil end end
+
+ for _,cell in ipairs(active.modeCells) do pcall(debug.setupvalue,cell.fn,cell.index,active.originalMode) end
+
+ active=nil profile="Stock" acceleration=0
+
+end
+
+local function close()
+
+ if closed then return end closed=true
+
+ restore()
+
+ for _,c in ipairs(connections) do c:Disconnect() end
+
+end
+
+bind(gui.Destroying,close)
+
+table.insert(cleanups,close)
+
+local function capture()
+
+ local g=P.PlayerGui:FindFirstChild("A-Chassis Interface")
+
+ local h=P.Character and P.Character:FindFirstChildOfClass("Humanoid")
+
+ local seat=h and h.SeatPart
+
+ if not g or not seat or not seat:IsA("VehicleSeat") or seat.Occupant~=h then return nil,"Sit in the driver's seat first." end
+
+ local carValue=g:FindFirstChild("Car") local d=g:FindFirstChild("Drive")
+
+ local car=carValue and carValue.Value
+
+ if not car or not d or not seat:IsDescendantOf(car) then return nil,"Car interface unavailable." end
+
+ if active and active.drive==d and active.seat==seat then return active end
+
+ restore()
+
+ local env=getsenv(d)
+
+ local tune=nil
+
+ for _,n in ipairs({"Engine","Steering","Gear"}) do
+
+  if type(env[n])=="function" then
+
+   for _,v in pairs(debug.getupvalues(env[n])) do
+
+    if type(v)=="table" and type(rawget(v,"SteerSpeed"))=="number" and type(rawget(v,"Ratios"))=="table" then tune=v break end
+
+   end
+
+  end
+
+  if tune then break end
+
+ end
+
+ if not tune then return nil,"Unsupported chassis; settings unchanged." end
+
+ local wheels=car:FindFirstChild("Wheels")
+
+ if not wheels then return nil,"Wheel group unavailable." end
+
+ local a={drive=d,env=env,tune=tune,car=car,seat=seat,wheels=wheels,original={},physics={},driveLists={},modeCells={}}
+
+ for _,k in ipairs(fields) do a.original[k]=tune[k] end
+
+ for k,v in pairs(tune) do if type(v)=="number" or type(v)=="boolean" then a.original[k]=v end end
+
+ a.springs={} a.anchors={} a.wheelEdits={} a.wheelOrder={}
+
+ for _,w in ipairs(wheels:GetChildren()) do if w:IsA("BasePart") then
+
+  table.insert(a.wheelOrder,w) a.wheelEdits[w]={X=0,Y=0,Z=0,RX=0,RY=0,RZ=0}
+
+  for _,x in ipairs(w:GetDescendants()) do
+
+   if x:IsA("SpringConstraint") then a.springs[x]={FreeLength=x.FreeLength,Stiffness=x.Stiffness,Damping=x.Damping,MinLength=x.MinLength,MaxLength=x.MaxLength}
+
+   elseif x:IsA("HingeConstraint") and x.Attachment0 and x.Attachment0.Parent.Name=="AxleP" then a.anchors[x.Attachment0]=x.Attachment0.CFrame end
+
+  end
+
+ end end
+
+ table.sort(a.wheelOrder,function(x,y) return x.Name<y.Name end)
+
+ for _,w in ipairs(wheels:GetChildren()) do
+
+  if w:IsA("BasePart") then a.physics[w]={custom=w.CustomPhysicalProperties,current=w.CurrentPhysicalProperties} end
+
+ end
+
+ local mode=g.Values:FindFirstChild("TransmissionMode")
+
+ a.originalMode=mode and mode.Value or "Auto"
+
+ for _,n in ipairs({"Engine","Auto","Gear"}) do
+
+  if type(env[n])=="function" then
+
+   for i,v in pairs(debug.getupvalues(env[n])) do
+
+    if type(v)=="table" and #v>0 then
+
+     local valid=true
+
+     for _,w in pairs(v) do if typeof(w)~="Instance" or not w:IsA("BasePart") or w.Parent~=wheels then valid=false break end end
+
+     if valid then a.driveLists[v]=copy(v) end
+
+    elseif type(v)=="string" and (v=="Auto" or v=="Semi" or v=="Manual") then
+
+     table.insert(a.modeCells,{fn=env[n],index=i})
+
+    end
+
+   end
+
+  end
+
+ end
+
+ active=a
+
+ return a
+
+end
+
+local function setDrive(a,mode)
+
+ local selected={}
+
+ for _,w in ipairs(a.wheels:GetChildren()) do
+
+  if w:IsA("BasePart") and (mode=="AWD" or mode=="FWD" and w.Name:sub(1,1)=="F" or mode=="RWD" and w.Name:sub(1,1)=="R") then table.insert(selected,w) end
+
+ end
+
+ if #selected==0 or next(a.driveLists)==nil then error("Driven wheels unavailable") end
+
+ for list in pairs(a.driveLists) do table.clear(list) for i,w in ipairs(selected) do list[i]=w end end
+
+ a.tune.Drivetrain=mode
+
+end
+
+local function tires(a,front,rear)
+
+ a.frontGrip=front a.rearGrip=rear
+
+ for w,v in pairs(a.physics) do
+
+  if w.Parent then local p=v.current
+
+   local m=w.Name:sub(1,1)=="R" and rear or front
+
+   w.CustomPhysicalProperties=PhysicalProperties.new(p.Density,math.clamp(p.Friction*m,0,2),p.Elasticity,p.FrictionWeight,p.ElasticityWeight)
+
+  end
+
+ end
+
+end
+
+local function preset(name)
+
+ restore()
+
+ local a,err=capture() if not a then notice=err return end
+
+ profile=name
+
+ a.tune.TransModes={"Auto","Semi","Manual"}
+
+ if name=="Sport" then
+
+  acceleration=35
+
+  tires(a,1.2,1.2)
+
+  for s,o in pairs(a.springs) do s.Stiffness=o.Stiffness*1.15 s.Damping=o.Damping*1.15 end
+
+  if a.tune.ShiftUpTime then a.tune.ShiftUpTime=math.max(0.05,a.tune.ShiftUpTime*0.75) end
+
+  a.tune.SpeedLimit=(a.original.SpeedLimit or 234)*1.35
+
+  a.tune.ThrotAccel=math.min((a.original.ThrotAccel or 0.05)*1.6,0.3)
+
+  notice="Sport: extra forward acceleration + higher chassis limiter."
+
+ elseif name=="Grip" then
+
+  tires(a,1.8,1.8)
+
+  a.tune.SteerSpeed=(a.original.SteerSpeed or 0.07)*1.4
+
+  a.tune.ReturnSpeed=(a.original.ReturnSpeed or 0.1)*1.3
+
+  notice="Grip: increased tire friction and quicker steering."
+
+ elseif name=="Drift" then
+
+  setDrive(a,"RWD")
+
+  tires(a,1.15,0.55)
+
+  if a.tune.RDiffPower then a.tune.RDiffPower=80 end
+
+  if a.tune.RDiffCoast then a.tune.RDiffCoast=55 end
+
+  for s,o in pairs(a.springs) do s.Damping=o.Damping*1.2 end
+
+  a.tune.SteerSpeed=(a.original.SteerSpeed or 0.07)*1.5
+
+  a.tune.ReturnSpeed=(a.original.ReturnSpeed or 0.1)*1.4
+
+  notice="Drift: RWD, reduced rear grip, quicker countersteer."
+
+ else notice="Stock restored." end
+
+ gui:SetAttribute("Profile",profile)
+
+end
+
+local function run(fn)
+
+ local ok,err=pcall(fn)
+
+ if not ok then restore() notice="Stopped and restored: "..tostring(err) end
+
+end
+
+local function make(kind,props,parent)
+
+ local o=Instance.new(kind) for k,v in pairs(props) do o[k]=v end o.Parent=parent return o
+
+end
+
+local panel=make("Frame",{Name="Panel",Position=UDim2.fromOffset(0,0),Size=UDim2.fromOffset(390,440),BackgroundColor3=Color3.fromRGB(20,20,20),BorderSizePixel=0},carPage)
+
+make("UICorner",{CornerRadius=UDim.new(0,12)},panel)
+
+local function label(name,value,y,height)
+
+ return make("TextLabel",{Name=name,Text=value,Position=UDim2.fromOffset(16,y),Size=UDim2.new(1,-32,0,height),BackgroundTransparency=1,TextColor3=Color3.fromRGB(230,230,230),Font=Enum.Font.Gotham,TextSize=13,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left},panel)
+
+end
+
+label("Title","CAR TUNER",0,44).Font=Enum.Font.GothamBold
+
+local body=make("Frame",{Name="Body",Position=UDim2.fromOffset(0,44),Size=UDim2.new(1,0,1,-44),BackgroundTransparency=1},panel)
+
+local function button(name,value,x,y,width,fn,owner)
+
+ local b=make("TextButton",{Name=name,Text=value,Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(width,32),BackgroundColor3=Color3.fromRGB(48,48,48),TextColor3=Color3.fromRGB(245,245,245),TextSize=13,Font=Enum.Font.GothamBold,BorderSizePixel=0},owner or body)
+
+ make("UICorner",{CornerRadius=UDim.new(0,7)},b)
+
+ bindUi(b,"Activated",function() run(fn) end)
+
+ return b
+
+end
+
+local status=label("Status","Stock / waiting",4,40) status.Parent=body
+
+button("Sport","SPORT",16,51,112,function() preset("Sport") end)
+
+button("Grip","GRIP",139,51,112,function() preset("Grip") end)
+
+button("Drift","DRIFT",262,51,112,function() preset("Drift") end)
+
+local note=label("Note","Preset",90,30) note.Parent=body
+
+for i,mode in ipairs({"FWD","RWD","AWD"}) do
+
+ button(mode,mode,16+(i-1)*123,143,112,function() local a,err=capture() if not a then notice=err return end setDrive(a,mode) notice="Driven wheels changed to "..mode end)
+
+end
+
+for i,mode in ipairs({"Auto","Semi","Manual"}) do
+
+ button(mode,mode,16+(i-1)*123,188,112,function()
+
+  local a,err=capture() if not a then notice=err return end
+
+  a.tune.TransModes={"Auto","Semi","Manual"}
+
+  if #a.modeCells==0 then notice="Transmission mode unavailable." return end
+
+  for _,cell in ipairs(a.modeCells) do debug.setupvalue(cell.fn,cell.index,mode) end
+
+  notice="Transmission: "..mode..". E up / Q down; M cycles mode."
+
+ end)
+
+end
+
+local help=label("Help","E / Q shift   •   M mode",232,34) help.Parent=body
+
+button("Reset","RESET TO STOCK",16,304,358,function() restore() notice="Original settings restored." gui:SetAttribute("Profile","Stock") end)
+
+local msg=label("Message",notice,344,40) msg.Parent=body
+
+local editorPages={Presets=body}
+
+local editorButtons={}
+
+body.Position=UDim2.fromOffset(0,88)
+
+body.Size=UDim2.new(1,0,1,-88)
+
+panel.Size=UDim2.fromOffset(515,444)
+
+body.ClipsDescendants=true
+
+-- Presets use their existing layout in a scrollable viewport.
+
+local presetScroll=make("ScrollingFrame",{Name="PresetScroll",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.fromOffset(0,395)},body)
+
+for _,child in ipairs(body:GetChildren()) do if child~=presetScroll then child.Parent=presetScroll end end
+
+local function editorPage(name)
+
+ local p=make("ScrollingFrame",{Name=name,Position=UDim2.fromOffset(0,88),Size=UDim2.new(1,0,1,-126),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.fromOffset(0,700),Visible=false},panel)
+
+ editorPages[name]=p return p
+
+end
+
+local performance=editorPage("Tuning")
+
+local suspension=editorPage("Springs")
+
+local wheelPage=editorPage("Wheels")
+
+for i,name in ipairs({"Presets","Tuning","Springs","Wheels"}) do
+
+ local b=button("Page"..name,name,12+(i-1)*125,46,119,function()
+
+  for n,p in pairs(editorPages) do p.Visible=n==name end
+
+  for n,x in pairs(editorButtons) do x.BackgroundColor3=n==name and Color3.fromRGB(235,235,235) or Color3.fromRGB(42,42,42) x.TextColor3=n==name and Color3.fromRGB(15,15,15) or Color3.fromRGB(235,235,235) end
+
+ end,panel)
+
+ editorButtons[name]=b
+
+end
+
+editorButtons.Presets.BackgroundColor3=Color3.fromRGB(235,235,235)
+
+editorButtons.Presets.TextColor3=Color3.fromRGB(15,15,15)
+
+local function text(parent,name,value,y,h)
+
+ return make("TextLabel",{Name=name,Text=value,Position=UDim2.fromOffset(14,y),Size=UDim2.fromOffset(480,h or 32),BackgroundTransparency=1,TextColor3=Color3.fromRGB(225,225,225),TextSize=12,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,Font=Enum.Font.Gotham},parent)
+
+end
+
+local editors={}
+
+local persistentNotice=text(panel,"EditorStatus",notice,410,32)
+
+body.Size=UDim2.new(1,0,1,-126)
+
+local function numeric(parent,key,title,y,low,high,step,get,set)
+
+ text(parent,key.."Title",title,y,32).Size=UDim2.fromOffset(250,32)
+
+ local box=make("TextBox",{Name=key,Text="—",Position=UDim2.fromOffset(309,y),Size=UDim2.fromOffset(112,32),BackgroundColor3=Color3.fromRGB(35,35,35),TextColor3=Color3.fromRGB(245,245,245),Font=Enum.Font.Code,TextSize=14,ClearTextOnFocus=false},parent)
+
+ make("UICorner",{CornerRadius=UDim.new(0,5)},box)
+
+ local function display()
+
+  if UIS:GetFocusedTextBox()==box then return end
+
+  local v=active and get(active)
+
+  box.Text=type(v)=="number" and string.format("%.3f",v):gsub("0+$",""):gsub("%.$","") or "—"
+
+ end
+
+ local function change(value)
+
+  local a,err=capture() if not a then notice=err return end
+
+  if not value or value~=value or math.abs(value)==math.huge then notice="Enter a finite number." display() return end
+
+  local current=get(a) if type(current)~="number" then notice="This setting is unavailable on this chassis." display() return end
+
+  if set(a,math.clamp(value,low,high))==false then display() return end
+
+  profile="Custom" notice=title.." updated." display()
+
+ end
+
+ bindUi(box,"FocusLost",function() run(function() change(tonumber(box.Text)) end) end)
+
+ button(key.."Minus","−",268,y,32,function() local a,err=capture() if not a then notice=err return end local v=get(a) if type(v)=="number" then change(v-step) end end,parent)
+
+ button(key.."Plus","+",430,y,32,function() local a,err=capture() if not a then notice=err return end local v=get(a) if type(v)=="number" then change(v+step) end end,parent)
+
+ table.insert(editors,display)
+
+end
+
+text(performance,"Help","Type a value or use − / +. Attach reads your current car. Reset restores captured settings. Some engine values are cached by the chassis and may not update live.",0,58)
+
+button("Attach","ATTACH / READ CAR",14,64,221,function() local a,e=capture() notice=a and "Car attached. Values loaded." or e end,performance)
+
+button("ResetAdvanced","RESET ALL",247,64,221,function() restore() notice="Original tuning, springs and wheel anchors restored." end,performance)
+
+local specs={
+
+ {"SpeedLimit","Chassis speed limit",10,600,10},
+
+ {"ThrotAccel","Throttle response",0.005,0.5,0.01},
+
+ {"ThrotDecel","Throttle release",0.01,1,0.05},
+
+ {"SteerSpeed","Steering response",0.01,0.5,0.01},
+
+ {"ReturnSpeed","Steering return",0.01,0.5,0.01},
+
+ {"SteerInner","Inside steering angle",5,70,1},
+
+ {"SteerOuter","Outside steering angle",5,65,1},
+
+ {"BrakeForce","Brake force",100,12000,100},
+
+ {"BrakeBias","Front brake bias",0,1,0.05},
+
+ {"PBrakeForce","Handbrake force",100,15000,100},
+
+ {"FinalDrive","Final drive ratio",1,8,0.1},
+
+ {"ShiftUpTime","Upshift time",0.03,2,0.025},
+
+ {"ShiftDnTime","Downshift time",0.03,2,0.025},
+
+ {"FDiffPower","Front diff power lock",0,100,5},
+
+ {"RDiffPower","Rear diff power lock",0,100,5},
+
+ {"RDiffCoast","Rear diff coast lock",0,100,5},
+
+ {"TCSLimit","Traction control limit",0,100,5},
+
+ {"ABSThreshold","ABS slip threshold",1,100,1}
+
+}
+
+for i,s in ipairs(specs) do
+
+ numeric(performance,s[1],s[2],109+(i-1)*42,s[3],s[4],s[5],function(a) return a.tune[s[1]] end,function(a,v) a.tune[s[1]]=v end)
+
+end
+
+local assistY=109+#specs*42
+
+numeric(performance,"Assist","Sport acceleration assist",assistY,0,100,5,function() return acceleration end,function(_,v) acceleration=v end)
+
+numeric(performance,"AssistCap","Assist cap (studs/s)",assistY+42,30,300,10,function() return speedCap end,function(_,v) speedCap=v end)
+
+numeric(performance,"FrontGrip","Front grip multiplier",assistY+84,0.1,3,0.1,function(a) return a.frontGrip or 1 end,function(a,v) a.frontGrip=v tires(a,v,a.rearGrip or 1) end)
+
+numeric(performance,"RearGrip","Rear grip multiplier",assistY+126,0.1,3,0.1,function(a) return a.rearGrip or 1 end,function(a,v) a.rearGrip=v tires(a,a.frontGrip or 1,v) end)
+
+performance.CanvasSize=UDim2.fromOffset(0,assistY+178)
+
+local axle="All"
+
+local axleButtons={}
+
+local function matches(w) return axle=="All" or axle=="Front" and w.Name:sub(1,1)=="F" or axle=="Rear" and w.Name:sub(1,1)=="R" or axle==w.Name end
+
+local function selectors(parent,y)
+
+ for i,n in ipairs({"All","Front","Rear","FL","FR","RL","RR"}) do
+
+  local b=button("Select"..n,n,14+(i-1)*68,y,62,function() axle=n end,parent)
+
+  table.insert(axleButtons,{b=b,name=n})
+
+ end
+
+end
+
+text(suspension,"Help","Select wheels, then edit their actual springs. Values apply on release. Mixed selections show the first spring. Height changes spring free length and travel limits together.",0,63)
+
+selectors(suspension,68)
+
+local function springGet(a,key)
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then for s in pairs(a.springs) do if s:IsDescendantOf(w) then return s[key] end end end end
+
+end
+
+local springSpecs={{"FreeLength","Spring free length",0.2,8,0.05},{"Stiffness","Spring stiffness",100,80000,500},{"Damping","Spring damping",0,10000,50},{"MinLength","Minimum travel length",0,8,0.05},{"MaxLength","Maximum travel length",0.1,10,0.05}}
+
+for i,spec in ipairs(springSpecs) do
+
+ numeric(suspension,spec[1],spec[2],114+(i-1)*44,spec[3],spec[4],spec[5],function(a) return springGet(a,spec[1]) end,function(a,v)
+
+  for s in pairs(a.springs) do
+
+   local w=s.Parent
+
+   if matches(w) then
+
+    if spec[1]=="MinLength" then s.MinLength=math.min(v,s.MaxLength)
+
+    elseif spec[1]=="MaxLength" then s.MaxLength=math.max(v,s.MinLength)
+
+    else s[spec[1]]=v end
+
+   end
+
+  end
+
+ end)
+
+end
+
+numeric(suspension,"RideHeight","Ride height offset (studs)",340,-0.8,1.5,0.05,function(a) for _,w in ipairs(a.wheelOrder) do if matches(w) then return a.wheelEdits[w].Height or 0 end end end,function(a,v)
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then a.wheelEdits[w].Height=v end end
+
+ for s,o in pairs(a.springs) do if matches(s.Parent) then
+
+  s.MinLength=math.max(0,o.MinLength+v)
+
+  s.MaxLength=math.max(s.MinLength+0.05,o.MaxLength+v)
+
+  s.FreeLength=math.max(0.1,o.FreeLength+v)
+
+ end end
+
+end)
+
+button("RestoreSprings","RESTORE SELECTED SPRINGS",14,390,454,function()
+
+ local a,e=capture() if not a then notice=e return end
+
+ for s,o in pairs(a.springs) do if matches(s.Parent) then s.MinLength=0 s.MaxLength=o.MaxLength s.MinLength=o.MinLength s.FreeLength=o.FreeLength s.Stiffness=o.Stiffness s.Damping=o.Damping end end
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then a.wheelEdits[w].Height=0 end end notice="Selected springs restored."
+
+end,suspension)
+
+suspension.CanvasSize=UDim2.fromOffset(0,443)
+
+text(wheelPage,"Help","Physical wheel anchor editor. Park below 3 studs/s to apply. Local XYZ offsets and rotations are relative to captured axle anchors; they are not world coordinates. Reset restores each anchor.",0,67)
+
+selectors(wheelPage,73)
+
+local function wheelGet(a,key)
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then return a.wheelEdits[w][key] end end
+
+end
+
+local function wheelSet(a,key,value)
+
+ if a.seat.AssemblyLinearVelocity.Magnitude>3 then notice="Park the car before changing wheel anchors." return false end
+
+ local count=0
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then
+
+  local e=a.wheelEdits[w] e[key]=value
+
+  local delta=CFrame.new(e.X,e.Y,e.Z)*CFrame.Angles(math.rad(e.RX),math.rad(e.RY),math.rad(e.RZ))
+
+  for att,o in pairs(a.anchors) do if att:IsDescendantOf(w) then att.CFrame=o*delta count+=1 end end
+
+ end end
+
+ if count==0 then error("Supported wheel axle anchors unavailable") end
+
+ return true
+
+end
+
+for i,s in ipairs({{"X","Local X position",-1,1,0.05},{"Y","Local Y position",-1,1,0.05},{"Z","Local Z position",-1,1,0.05},{"RX","Local X rotation",-15,15,1},{"RY","Local Y rotation",-15,15,1},{"RZ","Local Z rotation",-15,15,1}}) do
+
+ numeric(wheelPage,s[1],s[2],119+(i-1)*43,s[3],s[4],s[5],function(a) return wheelGet(a,s[1]) end,function(a,v) return wheelSet(a,s[1],v) end)
+
+end
+
+button("RestoreWheels","RESTORE SELECTED WHEELS",14,387,454,function()
+
+ local a,e=capture() if not a then notice=e return end
+
+ if a.seat.AssemblyLinearVelocity.Magnitude>3 then notice="Park the car first." return end
+
+ for att,o in pairs(a.anchors) do for _,w in ipairs(a.wheelOrder) do if matches(w) and att:IsDescendantOf(w) then att.CFrame=o end end end
+
+ for _,w in ipairs(a.wheelOrder) do if matches(w) then a.wheelEdits[w]={X=0,Y=0,Z=0,RX=0,RY=0,RZ=0} end end
+
+ notice="Selected wheel anchors restored."
+
+end,wheelPage)
+
+wheelPage.CanvasSize=UDim2.fromOffset(0,433)
+
+local editorElapsed=0
+
+bind(RS.Heartbeat,function(dt)
+
+ editorElapsed+=dt if editorElapsed<0.5 then return end editorElapsed=0
+
+ if not panel.Parent.Visible then return end
+
+ persistentNotice.Text=notice
+
+ local vals=active and active.drive.Parent:FindFirstChild("Values")
+
+ if vals then
+
+  local function value(n) local x=vals:FindFirstChild(n) return x and tostring(x.Value) or "—" end
+
+  help.Text=string.format("SPEED %.0f studs/s  |  RPM %s  |  GEAR %s\nBOOST %s  |  ABS %s  |  TCS %s",active.seat.AssemblyLinearVelocity.Magnitude,value("RPM"),value("Gear"),value("Boost"),value("ABSActive"),value("TCSActive"))
+
+ else help.Text="Attach car • E/Q shift • M mode" end
+
+ for _,refresh in ipairs(editors) do refresh() end
+
+ for _,item in ipairs(axleButtons) do local on=item.name==axle item.b.BackgroundColor3=on and Color3.fromRGB(235,235,235) or Color3.fromRGB(42,42,42) item.b.TextColor3=on and Color3.fromRGB(15,15,15) or Color3.fromRGB(235,235,235) end
+
+ for _,name in ipairs({"Sport","Grip","Drift"}) do local b=presetScroll:FindFirstChild(name) if b then local on=profile==name b.BackgroundColor3=on and Color3.fromRGB(235,235,235) or Color3.fromRGB(42,42,42) b.TextColor3=on and Color3.fromRGB(15,15,15) or Color3.fromRGB(235,235,235) end end
+
+ for _,name in ipairs({"FWD","RWD","AWD","Auto","Semi","Manual"}) do local b=presetScroll:FindFirstChild(name) if b then
+
+ local vals=active and active.drive.Parent:FindFirstChild("Values") local mode=vals and vals:FindFirstChild("TransmissionMode")
+
+ local on=active and (active.tune.Drivetrain==name or mode and mode.Value==name) or false
+
+ b.BackgroundColor3=on and Color3.fromRGB(235,235,235) or Color3.fromRGB(42,42,42) b.TextColor3=on and Color3.fromRGB(15,15,15) or Color3.fromRGB(235,235,235)
+
+ end end
+
+end)
+
+local elapsed=0
+
+bind(RS.Heartbeat,function(dt)
+
+ if closed then return end
+
+ if active then
+
+  local h=P.Character and P.Character:FindFirstChildOfClass("Humanoid")
+
+  if not active.drive.Parent or not h or h.SeatPart~=active.seat or active.seat.Occupant~=h then
+
+   restore() notice="Left the car. Original settings restored."
+
+  elseif acceleration>0 then
+
+   local v=active.seat.AssemblyLinearVelocity
+
+   local vals=active.drive.Parent:FindFirstChild("Values")
+
+   local throttle=vals and vals:FindFirstChild("Throttle")
+
+   local brake=vals and vals:FindFirstChild("Brake")
+
+   local gear=vals and vals:FindFirstChild("Gear")
+
+   local motor=active.car:FindFirstChild("Dynamic")
+
+   local on=motor and motor:FindFirstChild("CarTurnedOn")
+
+   if throttle and throttle.Value>0.1 and brake and brake.Value<0.1 and gear and gear.Value>0 and on and on.Value and not UIS:GetFocusedTextBox() then
+
+    local flat=Vector3.new(v.X,0,v.Z)
+
+    local look=active.seat.CFrame.LookVector local direction=Vector3.new(look.X,0,look.Z)
+
+    if flat.Magnitude<speedCap and direction.Magnitude>0.1 then
+
+     flat+=direction.Unit*acceleration*throttle.Value*math.min(dt,0.05)
+
+     if flat.Magnitude>speedCap then flat=flat.Unit*speedCap end
+
+     active.seat.AssemblyLinearVelocity=Vector3.new(flat.X,v.Y,flat.Z)
+
+    end
+
+   end
+
+  end
+
+ end
+
+ elapsed+=dt if elapsed<0.2 then return end elapsed=0
+
+ local mode="--"
+
+ if active then local v=active.drive.Parent:FindFirstChild("Values") local m=v and v:FindFirstChild("TransmissionMode") mode=m and m.Value or "--" end
+
+ status.Text=profile.."  |  "..(active and active.tune.Drivetrain or "--").."  |  "..mode
+
+ msg.Text=notice
+
+ gui:SetAttribute("Profile",profile)
+
+ gui:SetAttribute("Attached",active~=nil)
+
+end)
+
+
+end mountCar(pages.Car)
+
+local uiElapsed=0
+local resumeReadyBusy=false
+local beginResumeHandoff=function() end
+
+bind(RunService.Heartbeat,function(dt)
+ uiElapsed+=dt if uiElapsed<0.5 then return end uiElapsed=0
+
+ -- Legacy Roblox UI is retained only as an invisible backend for callbacks/state.
+ -- WindUI is the only visible interface.
+ if not dead then
+  pcall(function() gui.Enabled=false end)
+  if panel.Parent then
+   panel.Visible=false
+  end
+ end
+
+ local _,uses=inventory()
+ local current=balance()
+ if current~=nil then recordBalanceSnapshot(false) end
+ local ready=0
+ local selected=0
+
+ for i,r in ipairs(rows) do
+  local isReady=updateAvailability(r)
+  if isReady then ready+=1 end
+  if r.selected and isReady then selected+=1 end
+
+  if r.button and r.button.Parent then
+   local mark=r.selected and "●" or "○"
+   local suffix=isReady and "" or "  · busy"
+   r.button.Text=string.format("  %s  %02d  %s%s",mark,i,r.name,suffix)
+   selectedStyle(r.button,r.selected)
+  end
+ end
+
+
+ overview.Text=string.format(
+  "BALANCE   %s Riyal\nREADY      %d / %d\nEARNED     +%s Riyal\nSTATUS     %s",
+  commaNumber(current),
+  ready,#rows,
+  commaNumber(autoEarned),
+  running and (autoLoop and "AUTO FARM++" or "FARMING") or (autoLoop and "WAITING / HOPPING" or "IDLE")
+ )
+
+ homeStatus.Text="PLAYERS "..#Players:GetPlayers().."  •  LOCKPICK USES "..uses.."  •  "..afkStatus
+
+ local autoActive=autoLoop
+ loopButton.Text=autoActive and "STOP AUTO" or "START AUTO"
+ selectedStyle(loopButton,autoActive)
+
+ homeAutoButton.Text=autoActive and "STOP AUTO" or "START AUTO"
+ selectedStyle(homeAutoButton,autoActive)
+
+ selectedStyle(buyButton,config.autoBuy)
+
+ afkButton.Text=afkEnabled and "ANTI-AFK  ON" or "ANTI-AFK  OFF"
+ selectedStyle(afkButton,afkEnabled)
+
+ gui:SetAttribute("Running",running)
+ gui:SetAttribute("AutoPlus",autoLoop)
+ gui:SetAttribute("RobberyEarnings",autoEarned)
+ gui:SetAttribute("ServerJob",game.JobId)
+ gui:SetAttribute("PreviousJob",getTeleportState(AUTO_JOB_KEY))
+
+ if config.webhook and (running or autoLoop) then
+  webhookDirty=true
+ end
+
+ -- Independent fail-safe: if the countdown task stops advancing, do not leave
+ -- AUTO FARM++ frozen on the same number forever.
+ if countdownActive and autoLoop and countdownLastTick>0 and os.clock()-countdownLastTick>3.5 then
+  countdownToken+=1
+  countdownActive=false
+  countdownRemaining=0
+  countdownLastTick=0
+  countdownDeadline=0
+  routeStatus.Text="AUTO FARM++ / countdown recovered / starting"
+  webhookStatus="Countdown recovered • starting farm"
+  webhookDirty=true
+  log("AUTO FARM++ countdown watchdog recovered a stalled timer.")
+  if not resumeReadyBusy then task.defer(beginResumeHandoff) end
+ end
+
+end)
+
+armAutoCountdown=function(fromTeleport)
+ if dead or not autoLoop then return end
+ countdownToken+=1
+ local token=countdownToken
+ local duration=fromTeleport and AUTO_REJOIN_DELAY or AUTO_START_DELAY
+ countdownActive=true
+ countdownRemaining=duration
+ countdownDeadline=os.clock()+duration
+ countdownLastTick=os.clock()
+
+ if fromTeleport and (landedOnVisited or (previousJob~="" and previousJob==game.JobId)) then
+  countdownActive=false
+  countdownRemaining=0
+  countdownDeadline=0
+  routeStatus.Text="AUTO FARM++ / repeated server / rehopping"
+  setWebhookStatus("Repeated server detected • hopping again")
+  log("AUTO FARM++: landed in an already visited server; hopping again.")
+  task.delay(1,function()
+   if not dead and autoLoop and token==countdownToken then hopForAutoFarm() end
+  end)
+  return
+ end
+
+ local prefix=fromTeleport and "New server joined" or "Auto Farm++ started"
+ log(prefix.." / waiting "..tostring(duration).."s before farm readiness checks.")
+
+ task.spawn(function()
+  local lastShown=nil
+  while not dead and autoLoop and token==countdownToken do
+   local remaining=math.max(0,math.ceil(countdownDeadline-os.clock()))
+   countdownRemaining=remaining
+   countdownLastTick=os.clock()
+
+   if remaining~=lastShown then
+    lastShown=remaining
+    if remaining>0 then
+     routeStatus.Text="AUTO FARM++ / farming in "..remaining.."s"
+     webhookStatus="Waiting • farm in "..remaining.."s"
+     webhookDirty=true
+    end
+   end
+
+   if remaining<=0 then break end
+   task.wait(0.1)
+  end
+
+  if dead or not autoLoop or token~=countdownToken then return end
+  countdownRemaining=0
+  countdownActive=false
+  countdownDeadline=0
+  routeStatus.Text="AUTO FARM++ / starting"
+  webhookStatus="Starting farm"
+  webhookDirty=true
+  task.defer(beginResumeHandoff)
+ end)
+end
+
+local function bootAutoFarm()
+ autoLoop=true
+ setTeleportState(AUTO_RESUME_KEY,true) -- compatibility only
+ local fromTeleport=BOOT_STATE~=nil
+ setWebhookStatus(fromTeleport and "New server joined • preparing farm" or "Script loaded • preparing farm")
+ armAutoCountdown(fromTeleport)
+end
+
+manualFarmNow=function()
+ -- FARM NOW is deliberately a one-server action. It never enables the
+ -- Auto Farm loop, never queues itself across teleports, and never server-hops.
+ if dead or running or hopBusy or countdownActive then return end
+ autoLoop=false
+ countdownToken+=1
+ countdownActive=false
+ countdownRemaining=0
+ countdownLastTick=0
+ countdownDeadline=0
+ clearAutoResume()
+ routeStatus.Text="FARM NOW / scanning current server"
+ setWebhookStatus("Farm Now • current server only")
+ log("FARM NOW: farming this server only; server hopping is disabled.")
+
+ local ok,err=pcall(scan)
+ if not ok then
+  routeStatus.Text="FARM NOW / scan failed"
+  log("FARM NOW scan error: "..tostring(err))
+  return
+ end
+
+ start(false)
+end
+
+beginResumeHandoff=function()
+ if resumeReadyBusy then return end
+ resumeReadyBusy=true
+
+ local completed,problem=xpcall(function()
+  local readyDeadline=os.clock()+30
+  local emptyScanSince=nil
+  local lastReason="Waiting for game data"
+
+  while os.clock()<readyDeadline and not dead and autoLoop do
+   local character=player.Character
+   local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+   local root=character and character:FindFirstChild("HumanoidRootPart")
+
+   if not humanoid or humanoid.Health<=0 or not root then
+    lastReason="Waiting for character"
+   elseif humanoid.SeatPart then
+    lastReason="Waiting to be on foot"
+   else
+    local scanOk,scanErr=pcall(scan)
+    if not scanOk then
+     lastReason="Scan error"
+     log("AUTO FARM++ scan error: "..tostring(scanErr))
+    else
+     local readyCount=0
+     for _,r in ipairs(rows) do
+      local ok,isReady=pcall(updateAvailability,r)
+      if ok and isReady then readyCount+=1 end
+     end
+
+     if #rows>0 and readyCount>0 then
+      emptyScanSince=nil
+      routeStatus.Text="AUTO FARM++ / starting"
+      setWebhookStatus("Starting farm • "..readyCount.." cashier(s) ready")
+      log("AUTO FARM++ handoff: "..readyCount.." ready / "..#rows.." scanned.")
+      start(true)
+      if running then return end
+      lastReason=routeStatus.Text
+     elseif #rows>0 then
+      routeStatus.Text="AUTO FARM++ / no available cashiers / hopping"
+      setWebhookStatus("No cashiers available • hopping")
+      log("AUTO FARM++: cashiers loaded but none are available; hopping immediately.")
+      hopForAutoFarm()
+      return
+     else
+      emptyScanSince=emptyScanSince or os.clock()
+      if os.clock()-emptyScanSince>=4 then
+       routeStatus.Text="AUTO FARM++ / no cashiers found / hopping"
+       setWebhookStatus("No cashiers found • hopping")
+       log("AUTO FARM++: no cashier prompts appeared after a short load grace; hopping.")
+       hopForAutoFarm()
+       return
+      end
+      lastReason="Loading cashier prompts"
+     end
+    end
+   end
+
+   routeStatus.Text="AUTO FARM++ / "..lastReason
+   webhookStatus=lastReason
+   webhookDirty=true
+   task.wait(0.75)
+  end
+
+  if dead or not autoLoop then return end
+
+  routeStatus.Text="AUTO FARM++ / not ready / hopping"
+  setWebhookStatus("Server did not become farm-ready • hopping again")
+  log("AUTO FARM++: not farm-ready after 30s; hopping again.")
+  hopForAutoFarm()
+ end,debug.traceback)
+
+ resumeReadyBusy=false
+ if not completed then
+  routeStatus.Text="AUTO FARM++ / resume error"
+  log("AUTO FARM++ resume error: "..tostring(problem))
+  setWebhookStatus("Resume error")
+  task.wait(1)
+  if not dead and autoLoop then hopForAutoFarm() end
+ end
+end
+
+-- Webhook updates run in their own spawned request thread, so they never gate the
+-- farm/countdown logic. One edited Discord card is refreshed about once per second and carried across hops.
+task.spawn(function()
+ while not dead do
+  task.wait(0.25)
+  local due=os.clock()-webhookLastPush>=config.webhookInterval
+  if config.webhook and webhookDirty and due and os.clock()>=webhookRetryAt and not teleporting then
+   pushWebhook(false)
+  end
+ end
+end)
+
+-- Stay idle on a normal script execution. Auto Farm starts only when the user presses START AUTO.
+-- A queued copy created by our own server hop carries BOOT_STATE, so only that case resumes automatically.
+if not UI_PREVIEW and BOOT_STATE~=nil then bootAutoFarm() end
+
+-- WindUI frontend copied from the preferred Hashtag inc. layout.
+task.defer(function()
+ local windUiUrl="https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+ local windUiSource=runtimeEnv.__MONO_WINDUI_SOURCE
+ if type(windUiSource)~="string" or #windUiSource<1000 then
+  windUiSource=game:HttpGet(windUiUrl)
+  runtimeEnv.__MONO_WINDUI_SOURCE=windUiSource
+ end
+ local WindUI=loadstring(windUiSource)()
+ WindUI:SetParent(game:GetService("CoreGui"))
+ local window=WindUI:CreateWindow({
+  Title="Hashtag inc.",Author="Tik - hashtag.z",Size=UDim2.fromOffset(740,590),
+  Theme="Dark",Transparent=false,Acrylic=false,SideBarWidth=150,
+  HideSearchBar=true,ScrollBarEnabled=true,IgnoreAlerts=true,ToggleKey=Enum.KeyCode.RightShift,
+ })
+ local windowDestroyed=false
+ table.insert(cleanups,function() if not windowDestroyed then windowDestroyed=true window:Destroy() end end)
+ window:OnDestroy(function() windowDestroyed=true destroy() end)
+ local syncers={}
+ local ready=false
+ local bound,missing=0,0
+
+ local findCache=setmetatable({}, {__mode="k"})
+ local function find(root,name)
+  if not root then return nil end
+  local cache=findCache[root]
+  if not cache then cache={} findCache[root]=cache end
+  local cached=cache[name]
+  if cached and cached.Parent then return cached end
+  local found=root:FindFirstChild(name,true)
+  if found then cache[name]=found end
+  return found
+ end
+
+ local function notify(title,content,icon,duration)
+  pcall(function()
+   WindUI:Notify({
+    Title=tostring(title or "Hashtag inc."),
+    Content=tostring(content or ""),
+    Icon=icon or "bell",
+    Duration=duration or 3,
+   })
+  end)
+ end
+
+ local function invoke(object,event,...)
+  if dead or not ready then return end
+  local fn=object and uiHandlers[object] and uiHandlers[object][event]
+  if not fn then log("Control unavailable.") return end
+  local ok,err=pcall(fn,...)
+  if not ok then log("Control error: "..tostring(err)) end
+ end
+
+ local function verify(o,event)
+  bound+=1
+  if not (o and uiHandlers[o] and uiHandlers[o][event]) then missing+=1 end
+ end
+
+ local function section(tab,title,opened)
+  return tab:Section({Title=title,Opened=opened})
+ end
+
+ local function card(parent,title,get)
+  local last=tostring(get() or "")
+  local c=parent:Button({Title=title,Desc=last,Icon="",Callback=function() end})
+  table.insert(syncers,function()
+   local text=tostring(get() or "")
+   if text~=last then last=text c:SetDesc(text) end
+  end)
+  return c
+ end
+
+ local function action(parent,title,o,icon,noticeText)
+  verify(o,"Activated")
+  return parent:Button({Title=title,Icon=icon or "",Callback=function()
+   invoke(o,"Activated")
+   if noticeText then
+    task.defer(function()
+     local content=type(noticeText)=="function" and noticeText() or noticeText
+     if content and content~="" then notify(title,content,icon or "check",3) end
+    end)
+   end
+  end})
+ end
+
+ local function toggle(parent,title,o,get)
+  verify(o,"Activated")
+  local syncing=false
+  local last=get()
+  local c=parent:Toggle({Title=title,Value=last,Callback=function(value)
+   if not syncing and ready and value~=get() then
+    invoke(o,"Activated")
+    task.defer(function()
+     local actual=get()
+     notify(title,actual and "Enabled" or "Disabled",actual and "check" or "x",2.5)
+    end)
+   end
+  end})
+  table.insert(syncers,function()
+   local value=get()
+   if value~=last then last=value syncing=true c:Set(value) syncing=false end
+  end)
+  return c
+ end
+
+ local function input(parent,o,title)
+  if not o then missing+=1 return end
+  verify(o,"FocusLost")
+  local ticket=0
+  local c=parent:Input({Title=title,Value=o.Text,Desc="Current: "..o.Text,
+   Placeholder="Enter a number",Callback=function(value)
+    if not ready then return end
+    local text=tostring(value)
+    if not tonumber(text) then
+     notify(title,"Enter a valid number.","triangle-alert",2.5)
+     return
+    end
+    ticket+=1
+    local current=ticket
+    task.delay(0.6,function()
+     if dead or current~=ticket or not o.Parent then return end
+     o.Text=text
+     invoke(o,"FocusLost",true)
+     notify(title,"Updated to "..tostring(o.Text),"settings",2.5)
+    end)
+   end})
+  local last=o.Text
+  table.insert(syncers,function()
+   if o.Text~=last then last=o.Text c:SetDesc("Current: "..last) end
+  end)
+  return c
+ end
+
+ local home=window:Tab({Title="Home",Icon="house"})
+ local farm=window:Tab({Title="Farm",Icon="route"})
+ local carTab=window:Tab({Title="Car",Icon="car"})
+ local settings=window:Tab({Title="Settings",Icon="settings"})
+ local logs=window:Tab({Title="Activity",Icon="list"})
+
+ local session=section(home,"Your session",true)
+ card(session,"Balance & earnings",function() return overview.Text end)
+ card(session,"Current activity",function() return routeStatus.Text end)
+
+ local actions=section(home,"Quick actions",true)
+ local row=actions:Group({})
+ verify(homeAutoButton,"Activated")
+ local auto=row:Button({Title="Start auto",Icon="play",Desc="15s delay • farm • server hop • repeat",Callback=function()
+  local wasAuto=autoLoop or running
+  invoke(homeAutoButton,"Activated")
+  if wasAuto then
+   notify("Auto Farm stopped","The automatic farm and server-hop loop has been stopped.","square",3)
+  elseif autoLoop then
+   notify("Auto Farm started","Auto Farm is enabled and will activate after 15 seconds. After each farm cycle it will server-hop and repeat.","play",5)
+  else
+   notify("Auto Farm couldn't start",routeStatus.Text,"triangle-alert",4)
+  end
+ end})
+ local lastAutoTitle=nil
+ table.insert(syncers,function()
+  local title=autoLoop and "Stop auto" or "Start auto"
+  if title~=lastAutoTitle then lastAutoTitle=title auto:SetTitle(title) end
+ end)
+ local farmNowObject=find(pages.Overview,"FarmNow")
+ verify(farmNowObject,"Activated")
+ row:Button({Title="Farm now",Icon="zap",Desc="Current server only • never server hops",Callback=function()
+  if autoLoop or countdownActive or hopBusy then
+   notify("Farm Now unavailable","Stop Auto Farm before using Farm Now.","triangle-alert",3)
+   return
+  end
+  invoke(farmNowObject,"Activated")
+  if running and not autoLoop then
+   notify("Farm Now started","Farming the selected cashiers in this server only. This mode will not server-hop.","zap",4)
+  else
+   notify("Farm Now",routeStatus.Text,"info",3)
+  end
+ end})
+ local stop=actions:Group({})
+ stop:Button({Title="Stop farming",Icon="square",Callback=function()
+  stopRoute("Stopped")
+  notify("Farming stopped","All current farming activity has been stopped.","square",3)
+ end})
+ stop:Button({Title="Close hub",Icon="x",Callback=destroy})
+ toggle(actions,"Anti-AFK",afkButton,function() return afkEnabled end)
+ card(home,"Session details",function() return homeStatus.Text end)
+
+ local route=section(farm,"Cashier selection",true)
+ local toolsRow=route:Group({})
+ action(toolsRow,"Refresh cashiers",find(pages.Route,"Rescan"),"refresh-cw",function() return "Cashier list refreshed • "..tostring(#rows).." found." end)
+ toolsRow:Button({Title="Select all",Callback=function()
+  if not running then
+   for _,r in ipairs(rows) do r.selected=true end
+   notify("Cashiers","Selected all "..tostring(#rows).." cashiers.","check",2.5)
+  else
+   notify("Cashiers","Stop farming before changing the selection.","triangle-alert",2.5)
+  end
+ end})
+ toolsRow:Button({Title="Clear selection",Callback=function()
+  if not running then
+   for _,r in ipairs(rows) do r.selected=false end
+   notify("Cashiers","Cashier selection cleared.","x",2.5)
+  else
+   notify("Cashiers","Stop farming before changing the selection.","triangle-alert",2.5)
+  end
+ end})
+ card(route,"Selection",function()
+  local selected,availableCount=0,0
+  for _,r in ipairs(rows) do
+   if r.selected then selected+=1 end
+   if available(r) then availableCount+=1 end
+  end
+  return string.format("%d selected • %d ready • %d total",selected,availableCount,#rows)
+ end)
+
+ local cashierSection=section(farm,"Cashiers",true)
+ local cashierControls={}
+ local function refreshCashiers()
+  local present={}
+  for _,r in ipairs(rows) do
+   present[r]=true
+   if not cashierControls[r] then
+    local initialDesc=available(r) and "Ready" or "Busy"
+    local entry={syncing=false,lastSelected=r.selected,lastDesc=initialDesc}
+    entry.control=cashierSection:Toggle({
+     Title=r.name,
+     Value=r.selected,
+     Desc=initialDesc,
+     Callback=function(value)
+      if not entry.syncing and not running then r.selected=value end
+     end
+    })
+    cashierControls[r]=entry
+   end
+   local entry=cashierControls[r]
+   if entry.lastSelected~=r.selected then
+    entry.lastSelected=r.selected
+    entry.syncing=true
+    entry.control:Set(r.selected)
+    entry.syncing=false
+   end
+   local desc=available(r) and "Ready" or "Busy"
+   if entry.lastDesc~=desc then
+    entry.lastDesc=desc
+    entry.control:SetDesc(desc)
+   end
+  end
+  for r,entry in pairs(cashierControls) do
+   if not present[r] then
+    entry.control:Destroy()
+    cashierControls[r]=nil
+   end
+  end
+ end
+
+ local car=find(pages.Car,"Panel")
+ local tuning=find(car,"Tuning")
+ local springs=find(car,"Springs")
+ local wheels=find(car,"Wheels")
+ local presets=find(car,"PresetScroll")
+
+ local quick=section(carTab,"Car controls",true)
+ local carActions=quick:Group({})
+ do
+  local attachObject=find(tuning,"Attach")
+  verify(attachObject,"Activated")
+  carActions:Button({Title="Attach car",Icon="link",Callback=function()
+   invoke(attachObject,"Activated")
+   task.delay(0.6,function()
+    if dead then return end
+    local attached=gui:GetAttribute("Attached")==true
+    local statusObject=find(car,"EditorStatus")
+    local detail=statusObject and statusObject.Text or ""
+    notify(attached and "Car attached" or "Car attach failed",attached and "Car attached. Values loaded." or (detail~="" and detail or "Sit in the driver seat and try again."),attached and "check" or "triangle-alert",4)
+   end)
+  end})
+ end
+ action(carActions,"Restore stock",find(presets,"Reset"),"rotate-ccw","Original car settings restored.")
+ card(quick,"Car status",function()
+  local o=find(car,"EditorStatus")
+  return o and o.Text or "Unavailable"
+ end)
+
+ local presetRow=quick:Group({})
+ for _,name in ipairs({"Sport","Grip","Drift"}) do
+  action(presetRow,name,find(presets,name),nil,name.." preset applied.")
+ end
+
+ local function options(parent,title,root,values,prefix)
+  for _,name in ipairs(values) do verify(find(root,(prefix or "")..name),"Activated") end
+  parent:Dropdown({Title=title,Values=values,Callback=function(value)
+   if ready then
+    invoke(find(root,(prefix or "")..value),"Activated")
+    notify(title,"Set to "..tostring(value)..".","settings",2.5)
+   end
+  end})
+ end
+
+ options(quick,"Drivetrain",presets,{"FWD","RWD","AWD"})
+ options(quick,"Transmission",presets,{"Auto","Semi","Manual"})
+ card(quick,"Driving",function()
+  local o=find(presets,"Help")
+  return o and o.Text or ""
+ end)
+
+ local performance=section(carTab,"Engine & transmission",false)
+ local handling=section(carTab,"Steering, brakes & grip",false)
+ local engineKeys={SpeedLimit=true,ThrotAccel=true,ThrotDecel=true,FinalDrive=true,ShiftUpTime=true,ShiftDnTime=true,Assist=true,AssistCap=true}
+
+ local function numericGroup(root,parent,split)
+  if not root then return end
+  local boxes={}
+  for _,o in ipairs(root:GetDescendants()) do
+   if o:IsA("TextBox") then table.insert(boxes,o) end
+  end
+  table.sort(boxes,function(a,b) return a.Position.Y.Offset<b.Position.Y.Offset end)
+  local built=0
+  for _,o in ipairs(boxes) do
+   local titleLabel=find(root,o.Name.."Title") or find(root,o.Name.."Label")
+   input(split and (engineKeys[o.Name] and performance or handling) or parent,o,titleLabel and titleLabel.Text or o.Name)
+   built+=1
+   if built%8==0 then task.wait() end
+  end
+ end
+
+ numericGroup(tuning,performance,true)
+
+ local suspensionSection=section(carTab,"Suspension",false)
+ options(suspensionSection,"Apply to wheels",springs,{"All","Front","Rear","FL","FR","RL","RR"},"Select")
+ numericGroup(springs,suspensionSection)
+ action(suspensionSection,"Restore selected springs",find(springs,"RestoreSprings"),"rotate-ccw","Selected spring settings restored.")
+
+ local wheelSection=section(carTab,"Wheel position & rotation",false)
+ options(wheelSection,"Apply to wheels",wheels,{"All","Front","Rear","FL","FR","RL","RR"},"Select")
+ numericGroup(wheels,wheelSection)
+ action(wheelSection,"Restore selected wheels",find(wheels,"RestoreWheels"),"rotate-ccw","Selected wheel settings restored.")
+
+ local farmingSettings=section(settings,"Farming options",true)
+ toggle(farmingSettings,"Buy lockpicks automatically",buyButton,function() return config.autoBuy end)
+ for _,v in ipairs({
+  {"Budget","Budget per cycle"},
+  {"Retries","Retry attempts"},
+  {"Timeout","Payout timeout (seconds)"},
+  {"Settle","Arrival delay (seconds)"},
+  {"HopDelay","Post-hop delay (fixed 15s)"}
+ }) do
+  input(farmingSettings,find(pages.Settings,v[1]),v[2])
+ end
+
+ local notifications=section(settings,"Discord updates",false)
+ toggle(notifications,"Send webhook updates",webhookButton,function() return config.webhook end)
+ card(notifications,"Connection",function() return webhookInfo.Text end)
+ action(notifications,"Test webhook",find(pages.Settings,"WebhookTest"),"send","Webhook test sent. Check Activity for the HTTP result.")
+
+ local logActions=logs:Group({})
+ logActions:Button({Title="Copy log",Icon="copy",Callback=function()
+  local ok=pcall(function() setclipboard(table.concat(activity,"\n\n")) end)
+  notify("Activity log",ok and "Copied to clipboard." or "Clipboard is unavailable in this executor.",ok and "copy" or "triangle-alert",2.5)
+ end})
+ logActions:Button({Title="Clear log",Icon="trash",Callback=function()
+  table.clear(activity)
+  logLabel.Text=""
+  notify("Activity log","Log cleared.","trash",2.5)
+ end})
+ card(logs,"Recent activity",function() return logLabel.Text end)
+
+ ready=true
+ window:SelectTab(home)
+ refreshCashiers()
+
+ if autoLoop and countdownActive then
+  notify("Auto Farm resumed","New server joined. Auto Farm will activate after the 15-second countdown, then farm and server-hop again.","refresh-cw",5)
+ end
+
+ if UI_PREVIEW then
+  print(string.format("WindUI layout: 5 tabs; %d callback bindings; %d missing",bound,missing))
+ end
+
+ local elapsed=0
+ bind(RunService.Heartbeat,function(dt)
+  if dead then return end
+
+
+  elapsed+=dt
+  if elapsed<1 then return end
+  elapsed=0
+  gui.Enabled=false
+  for _,sync in ipairs(syncers) do
+   local ok,err=pcall(sync)
+   if not ok and UI_PREVIEW then warn("WindUI sync error: "..tostring(err)) end
+  end
+  pcall(refreshCashiers)
+ end)
+
+ log("Hashtag inc. layout ready. Right Shift shows or hides the hub.")
+end)
+
+task.defer(fitAndClampPanel)
+
+return "Monochrome Hub v8.6 OVERNIGHT + Hashtag inc. optimized v6 / farm modes + notifications"
+
+]========]
+local OPEN="["..string.rep("=",8).."["
+local CLOSE="]"..string.rep("=",8).."]"
+local SOURCE=TEMPLATE:gsub("__MONO_TEMPLATE_LITERAL__",function()
+ return OPEN..TEMPLATE..CLOSE
+end,1)
+
+return loadstring(SOURCE)()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
