@@ -2967,7 +2967,7 @@ task.defer(function()
  local WindUI=loadstring(windUiSource)()
  WindUI:SetParent(game:GetService("CoreGui"))
  local window=WindUI:CreateWindow({
-  Title="Hashtag inc. مجاني للجميع",Author="Tik - hashtag.z",Size=UDim2.fromOffset(740,590),
+  Title="Hashtag inc. الهاك راح يبندك اذا استعملت تجميع الفلوس ",Author="Tik - hashtag.z",Size=UDim2.fromOffset(740,590),
   Theme="Dark",Transparent=false,Acrylic=false,SideBarWidth=150,
   HideSearchBar=true,ScrollBarEnabled=true,IgnoreAlerts=true,ToggleKey=Enum.KeyCode.RightShift,
  })
